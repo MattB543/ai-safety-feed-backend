@@ -1,8 +1,25 @@
 const express = require("express");
 const { Pool } = require("pg");
+const cors = require("cors");
 require("dotenv").config();
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
+
+app.use(helmet());
+
+// Apply rate limiting to all requests
+const limiter = rateLimit({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 100, // Limit each IP to 100 requests per `windowMs`
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+  message: "Too many requests from this IP, please try again after 10 minutes",
+});
+
+// Apply the rate limiting middleware to all requests
+app.use(limiter);
 
 const PORT = process.env.PORT || 3000;
 
@@ -14,6 +31,9 @@ const pool = new Pool({
 
 // Middleware to parse JSON
 app.use(express.json());
+
+// Enable CORS
+app.use(cors());
 
 // Define the /health endpoint
 app.get("/health", (req, res) => {
@@ -33,7 +53,5 @@ app.get("/api/content", async (req, res) => {
 
 // Start the server and listen on the defined port
 app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-  console.log(`Health check available at http://localhost:${PORT}/health`);
-  console.log(`Content API available at http://localhost:${PORT}/api/content`);
+  console.log(`Server is running on port ${PORT}`);
 });
