@@ -29,6 +29,11 @@ const pool = new Pool({
   // ssl: { rejectUnauthorized: false } // Uncomment if needed
 });
 
+// Add error handler for the pool
+pool.on("error", (err) => {
+  console.error("Unexpected error on database client", err);
+});
+
 // Middleware to parse JSON
 app.use(express.json());
 
@@ -42,8 +47,30 @@ app.get("/health", (req, res) => {
 
 // Endpoint to fetch content from database
 app.get("/api/content", async (req, res) => {
+  const searchTerm = req.query.search;
+  let query = "SELECT * FROM content";
+  const queryParams = [];
+
+  if (searchTerm) {
+    // Basic search across multiple fields
+    // NOTE: Consider PostgreSQL Full-Text Search for better performance/relevance later
+    query += ` WHERE title ILIKE $1
+               OR array_to_string(authors, ' ') ILIKE $1
+               OR sentence_summary ILIKE $1
+               OR paragraph_summary ILIKE $1
+               OR array_to_string(topics, ' ') ILIKE $1
+               OR why_valuable ILIKE $1
+               OR unique_aspects ILIKE $1
+               OR author_credentials ILIKE $1`;
+    queryParams.push(`%${searchTerm}%`); // Add wildcards for partial match
+  }
+
+  // Always order by date, regardless of search
+  query += " ORDER BY published_date DESC"; // Keep existing sort
+
   try {
-    const result = await pool.query("SELECT * FROM content");
+    // Use parameterized query
+    const result = await pool.query(query, queryParams);
     return res.status(200).json(result.rows);
   } catch (err) {
     console.error("Error fetching content:", err);
