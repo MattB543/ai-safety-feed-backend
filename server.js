@@ -6,6 +6,11 @@ const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const { Parser } = require("json2csv");
 
+const { GoogleGenAI } = require("@google/genai");
+
+const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const GEMINI_MODEL = "gemini-2.5-flash-preview-04-17";
+
 const app = express();
 
 app.use(helmet());
@@ -82,6 +87,37 @@ function buildWhere({ search, sources }) {
 
   const whereSQL = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
   return { whereSQL, params };
+}
+
+// Helper function to build the prompt for reranking candidates
+function buildRerankPrompt(ref, candidates) {
+  const refBlock = `REFERENCE ARTICLE
+ID: ${ref.id}
+Title: ${ref.title}
+Summary: ${ref.sentence_summary || ""}
+Main points: ${ref.paragraph_summary || ""}
+Key implication: ${ref.key_implication || ""}`.trim();
+
+  const candBlocks = candidates
+    .map((c, i) =>
+      `CANDIDATE ${i + 1}
+ID: ${c.id}
+Title: ${c.title}
+Summary: ${c.sentence_summary || ""}
+Main points: ${c.paragraph_summary || ""}
+Key implication: ${c.key_implication || ""}`.trim()
+    )
+    .join("\n\n");
+
+  return `
+${refBlock}
+
+${candBlocks}
+
+TASK
+Return a JSON array only with 5 - 10 candidate IDs, ordered most similar → least when compared to the REFERENCE ARTICLE.
+Do not add back-ticks or commentary or anything else.
+`.trim();
 }
 
 // Endpoint to fetch distinct source types
@@ -221,6 +257,139 @@ app.get("/api/content/export", async (_req, res) => {
   } catch (err) {
     console.error("CSV export error:", err);
     return res.status(500).json({ error: "Failed to export CSV" });
+  }
+});
+
+app.get("/api/similar/:id", async (req, res) => {
+  const { id } = req.params;
+  const k = 15; // candidates
+  const n = 10; // final results
+  console.log(`[similar/${id}] START: k=${k}, n=${n}`);
+
+  try {
+    // 1. reference row + embeddings
+    console.log(`[similar/${id}] Fetching reference post...`);
+    const {
+      rows: [ref],
+    } = await pool.query(
+      "SELECT * FROM content WHERE id=$1 AND embedding_short IS NOT NULL AND embedding_full IS NOT NULL",
+      [id]
+    );
+    if (!ref) {
+      console.log(`[similar/${id}] Reference post not found.`);
+      return res.status(404).json({ error: "Post not found" });
+    }
+    console.log(`[similar/${id}] Found reference post: ${ref.title}`);
+
+    // 2. pgvector nearest-neighbour union
+    console.log(
+      `[similar/${id}] Fetching ${k} candidates via vector search...`
+    );
+    const { rows: cands } = await pool.query(
+      `
+      (SELECT *, embedding_short <=> $1 AS dist
+         FROM content
+        WHERE id <> $3
+     ORDER BY embedding_short <=> $1
+        LIMIT $2)
+      UNION
+      (SELECT *, embedding_full  <=> $4 AS dist
+         FROM content
+        WHERE id <> $3
+     ORDER BY embedding_full  <=> $4
+        LIMIT $2)
+      `,
+      [ref.embedding_short, k, id, ref.embedding_full]
+    );
+    console.log(`[similar/${id}] Found ${cands.length} candidates.`);
+
+    // Deduplicate candidates based on ID, keeping the first occurrence
+    const uniqueCandsMap = new Map();
+    cands.forEach((cand) => {
+      if (!uniqueCandsMap.has(cand.id)) {
+        uniqueCandsMap.set(cand.id, cand);
+      }
+    });
+    const uniqueCands = Array.from(uniqueCandsMap.values());
+    console.log(
+      `[similar/${id}] Deduplicated to ${uniqueCands.length} unique candidates.`
+    );
+
+    /* ---------- 3. Gemini re-rank (optional) ---------- */
+    let finalIds;
+    if (genAI && GEMINI_MODEL) {
+      const prompt = buildRerankPrompt(ref, uniqueCands);
+      console.log(
+        `[similar/${id}] Sending prompt to Gemini for reranking ${uniqueCands.length} candidates down to ${n}...`
+      );
+      console.log(`[similar/${id}] Gemini Prompt:\n${prompt}`); // Uncomment for full prompt
+      const resp = await genAI.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.1,
+          responseMimeType: "application/json",
+        },
+      });
+
+      try {
+        console.log("Response:", resp);
+        const geminiResponseText = resp.candidates[0].content.parts[0].text;
+        console.log(
+          `[similar/${id}] Gemini raw response: ${geminiResponseText}`
+        );
+        // Extract the JSON array part
+        const jsonMatch = geminiResponseText.match(/\[.*\]/s);
+        if (jsonMatch && jsonMatch[0]) {
+          finalIds = JSON.parse(jsonMatch[0]);
+          console.log(
+            `[similar/${id}] Parsed Gemini IDs: ${JSON.stringify(finalIds)}`
+          );
+        } else {
+          throw new Error("No valid JSON array found in Gemini response");
+        }
+      } catch (e) {
+        console.warn(
+          `[similar/${id}] Gemini JSON parse failed, falling back to vector order:`,
+          e
+        );
+      }
+    } else {
+      console.log(
+        `[similar/${id}] Gemini client or model not configured, skipping rerank.`
+      );
+    }
+
+    // 4. fallback or use vector order if Gemini missing / failed
+    if (!Array.isArray(finalIds) || finalIds.length === 0) {
+      console.log(`[similar/${id}] Using fallback vector similarity order.`);
+      // Use uniqueCands for fallback as well
+      finalIds = uniqueCands
+        .sort((a, b) => a.dist - b.dist)
+        .slice(0, n)
+        .map((r) => r.id);
+      console.log(`[similar/${id}] Fallback IDs: ${JSON.stringify(finalIds)}`);
+    }
+
+    // 5. fetch rows & preserve order
+    console.log(`[similar/${id}] Fetching final ${finalIds.length} posts...`);
+    const numericFinalIds = finalIds.map(Number); // Convert string IDs to numbers
+    const { rows: finals } = await pool.query(
+      "SELECT * FROM content WHERE id = ANY($1::int[])",
+      [numericFinalIds] // Use the numeric array
+    );
+    console.log(
+      `[similar/${id}] Found ${finals.length} posts in DB matching final IDs.`
+    );
+    const ordered = finalIds
+      .map((fid) => finals.find((r) => r.id === Number(fid))) // Compare with numeric ID
+      .filter(Boolean);
+    console.log(`[similar/${id}] Returning ${ordered.length} ordered posts.`);
+
+    res.json(ordered);
+  } catch (err) {
+    console.error(`[similar/${id}] Error in route:`, err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
