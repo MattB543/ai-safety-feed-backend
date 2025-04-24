@@ -115,8 +115,8 @@ ${refBlock}
 ${candBlocks}
 
 TASK
-Return a JSON array only with 5 - 10 candidate IDs, ordered most similar → least when compared to the REFERENCE ARTICLE.
-Do not add back-ticks or commentary or anything else.
+Based on semantic similarity (considering topics, summaries, implications, etc.), return a JSON array only with 5 to 10 candidate IDs, ordered most similar to least similar when compared to the REFERENCE ARTICLE.
+Ensure the output is only the JSON array (e.g., ["id1", "id2", ...]) with no other text, commentary, or formatting like back-ticks.
 `.trim();
 }
 
