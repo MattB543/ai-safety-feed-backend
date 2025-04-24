@@ -193,6 +193,9 @@ app.get("/api/tags", async (_req, res) => {
 // Endpoint to fetch content from database
 app.get("/api/content", async (req, res) => {
   const { search, sources, tags } = req.query;
+  const limit = parseInt(req.query.limit) || 50; // Default limit to 50
+  const offset = parseInt(req.query.offset) || 0; // Default offset to 0
+
   const { whereSQL: searchSourceWhereSQL, params: searchSourceParams } =
     buildWhere({ search, sources });
 
@@ -219,13 +222,26 @@ app.get("/api/content", async (req, res) => {
     }
   }
 
-  let query = "SELECT * FROM content";
+  let query = `SELECT
+  id, title, sentence_summary, paragraph_summary, key_implication,
+  image_url, source_url, source_type,
+  authors, topics, cluster_tag, published_date
+FROM content`;
   if (conditions.length > 0) {
     // Join conditions with AND, prepending WHERE
-    query += " WHERE " + conditions.join(" AND ");
+    query += " WHERE " + conditions.join(" AND "); // filters here
   }
 
   query += " ORDER BY published_date DESC";
+
+  // Add LIMIT and OFFSET for pagination
+  const limitParamIndex = finalParams.length + 1;
+  query += ` LIMIT $${limitParamIndex}`;
+  finalParams.push(limit);
+
+  const offsetParamIndex = finalParams.length + 1;
+  query += ` OFFSET $${offsetParamIndex}`;
+  finalParams.push(offset);
 
   try {
     const result = await pool.query(query, finalParams);
@@ -235,6 +251,23 @@ app.get("/api/content", async (req, res) => {
     console.error("Faulty Query:", query); // Log the query on error
     console.error("Parameters:", finalParams); // Log the parameters on error
     return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// NEW endpoint to fetch a single post by ID
+app.get("/api/content/:id", async (req, res) => {
+  try {
+    const {
+      rows: [post],
+    } = await pool.query("SELECT * FROM content WHERE id=$1", [req.params.id]);
+    if (post) {
+      res.json(post);
+    } else {
+      res.sendStatus(404);
+    }
+  } catch (err) {
+    console.error(`Error fetching content with ID ${req.params.id}:`, err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
