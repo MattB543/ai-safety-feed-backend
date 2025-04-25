@@ -59,16 +59,16 @@ function buildWhere({ search, sources }) {
 
   if (search) {
     clauses.push(`(
-      title ILIKE $${i} OR
-      array_to_string(authors,' ') ILIKE $${i} OR
-      sentence_summary ILIKE $${i} OR
-      paragraph_summary ILIKE $${i} OR
-      array_to_string(topics,' ') ILIKE $${i} OR
-      why_valuable ILIKE $${i} OR
-      unique_aspects ILIKE $${i} OR
-      author_credentials ILIKE $${i} OR
-      cluster_tag ILIKE $${i}
-    )`);
+        title ILIKE $${i} OR
+        array_to_string(authors,' ') ILIKE $${i} OR
+        sentence_summary ILIKE $${i} OR
+        paragraph_summary ILIKE $${i} OR
+        array_to_string(topics,' ') ILIKE $${i} OR
+        why_valuable ILIKE $${i} OR
+        unique_aspects ILIKE $${i} OR
+        author_credentials ILIKE $${i} OR
+        cluster_tag ILIKE $${i}
+      )`);
     params.push(`%${search}%`); // Add wildcards for partial match
     i++;
   }
@@ -92,32 +92,32 @@ function buildWhere({ search, sources }) {
 // Helper function to build the prompt for reranking candidates
 function buildRerankPrompt(ref, candidates) {
   const refBlock = `REFERENCE ARTICLE
-ID: ${ref.id}
-Title: ${ref.title}
-Summary: ${ref.sentence_summary || ""}
-Main points: ${ref.paragraph_summary || ""}
-Key implication: ${ref.key_implication || ""}`.trim();
+  ID: ${ref.id}
+  Title: ${ref.title}
+  Summary: ${ref.sentence_summary || ""}
+  Main points: ${ref.paragraph_summary || ""}
+  Key implication: ${ref.key_implication || ""}`.trim();
 
   const candBlocks = candidates
     .map((c, i) =>
-      `CANDIDATE ${i + 1}
-ID: ${c.id}
-Title: ${c.title}
-Summary: ${c.sentence_summary || ""}
-Main points: ${c.paragraph_summary || ""}
-Key implication: ${c.key_implication || ""}`.trim()
+      `---
+  ID: ${c.id}
+  Title: ${c.title}
+  Summary: ${c.sentence_summary || ""}
+  Main points: ${c.paragraph_summary || ""}
+  Key implication: ${c.key_implication || ""}`.trim()
     )
     .join("\n\n");
 
   return `
-${refBlock}
+  ${refBlock}
 
-${candBlocks}
+  ${candBlocks}
 
-TASK
-Based on semantic similarity (considering topics, summaries, implications, etc.), return a JSON array only with 5 to 10 candidate IDs, ordered most similar to least similar when compared to the REFERENCE ARTICLE.
-Ensure the output is only the JSON array (e.g., ["id1", "id2", ...]) with no other text, commentary, or formatting like back-ticks.
-`.trim();
+  TASK
+  Based on semantic similarity (considering topics, summaries, implications, etc.), return a JSON array only with 5 to 10 candidate IDs, ordered most similar to least similar when compared to the REFERENCE ARTICLE.
+  Ensure the output is only the JSON array (e.g., ["id1", "id2", ...]) with no other text, commentary, or formatting like back-ticks.
+  `.trim();
 }
 
 // Endpoint to fetch distinct source types
@@ -150,19 +150,19 @@ app.get("/api/source-stats", async (req, res) => {
         tagSQL =
           (base ? " AND " : "WHERE ") +
           `
-          LOWER(cluster_tag) = ANY($${params.length + 1}::text[])
-        `;
+            LOWER(cluster_tag) = ANY($${params.length + 1}::text[])
+          `;
         params.push(list);
       }
     }
 
     const sql = `
-      SELECT source_type, COUNT(*)::int AS count
-      FROM   content
-      ${base} ${tagSQL}
-      GROUP  BY source_type
-      ORDER  BY source_type
-    `;
+        SELECT source_type, COUNT(*)::int AS count
+        FROM   content
+        ${base} ${tagSQL}
+        GROUP  BY source_type
+        ORDER  BY source_type
+      `;
     const result = await pool.query(sql, params);
     res.json(result.rows); // → [{source_type, count}, …]
   } catch (err) {
@@ -175,13 +175,13 @@ app.get("/api/source-stats", async (req, res) => {
 app.get("/api/tags", async (_req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT LOWER(cluster_tag) AS tag,
-             COUNT(*)::int      AS post_count
-      FROM   content
-      WHERE  cluster_tag IS NOT NULL
-      GROUP  BY tag
-      ORDER  BY post_count DESC, tag ASC
-    `);
+        SELECT LOWER(cluster_tag) AS tag,
+              COUNT(*)::int      AS post_count
+        FROM   content
+        WHERE  cluster_tag IS NOT NULL
+        GROUP  BY tag
+        ORDER  BY post_count DESC, tag ASC
+      `);
 
     return res.json(rows); // [{tag:"ai alignment", post_count:237}, …]
   } catch (err) {
@@ -192,7 +192,7 @@ app.get("/api/tags", async (_req, res) => {
 
 // Endpoint to fetch content from database
 app.get("/api/content", async (req, res) => {
-  const { search, sources, tags } = req.query;
+  const { search, sources, tags, novelty_bucket } = req.query;
   const limit = parseInt(req.query.limit) || 50; // Default limit to 50
   const offset = parseInt(req.query.offset) || 0; // Default offset to 0
 
@@ -216,17 +216,45 @@ app.get("/api/content", async (req, res) => {
     if (tagList.length > 0) {
       const nextParamIndex = finalParams.length + 1;
       conditions.push(`
-        LOWER(cluster_tag) = ANY($${nextParamIndex}::text[])
-      `);
+          LOWER(cluster_tag) = ANY($${nextParamIndex}::text[])
+        `);
       finalParams.push(tagList); // Add lowercased tagList to final parameters
     }
   }
 
+  // Add novelty_bucket filter if provided
+  if (novelty_bucket) {
+    const bucket = parseInt(novelty_bucket);
+    let minScore = 0;
+    switch (bucket) {
+      case 2:
+        minScore = 21;
+        break;
+      case 3:
+        minScore = 41;
+        break;
+      case 4:
+        minScore = 71;
+        break;
+      case 5:
+        minScore = 91;
+        break;
+      // case 1 and default: minScore = 0 (no filter needed for >= 0)
+    }
+
+    // Only add the condition if minScore > 0
+    if (minScore > 0) {
+      conditions.push(`novelty_score >= $${finalParams.length + 1}`);
+      finalParams.push(minScore);
+    }
+  }
+
   let query = `SELECT
-  id, title, sentence_summary, paragraph_summary, key_implication,
-  image_url, source_url, source_type,
-  authors, topics, cluster_tag, published_date
-FROM content`;
+    id, title, sentence_summary, paragraph_summary, key_implication,
+    novelty_score, novelty_note,
+    image_url, source_url, source_type,
+    authors, topics, cluster_tag, published_date
+  FROM content`;
   if (conditions.length > 0) {
     // Join conditions with AND, prepending WHERE
     query += " WHERE " + conditions.join(" AND "); // filters here
@@ -320,18 +348,18 @@ app.get("/api/similar/:id", async (req, res) => {
     );
     const { rows: cands } = await pool.query(
       `
-      (SELECT *, embedding_short <=> $1 AS dist
-         FROM content
-        WHERE id <> $3
-     ORDER BY embedding_short <=> $1
-        LIMIT $2)
-      UNION
-      (SELECT *, embedding_full  <=> $4 AS dist
-         FROM content
-        WHERE id <> $3
-     ORDER BY embedding_full  <=> $4
-        LIMIT $2)
-      `,
+        (SELECT *, embedding_short <=> $1 AS dist
+          FROM content
+          WHERE id <> $3
+      ORDER BY embedding_short <=> $1
+          LIMIT $2)
+        UNION
+        (SELECT *, embedding_full  <=> $4 AS dist
+          FROM content
+          WHERE id <> $3
+      ORDER BY embedding_full  <=> $4
+          LIMIT $2)
+        `,
       [ref.embedding_short, k, id, ref.embedding_full]
     );
     console.log(`[similar/${id}] Found ${cands.length} candidates.`);
