@@ -192,7 +192,7 @@ app.get("/api/tags", async (_req, res) => {
 
 // Endpoint to fetch content from database
 app.get("/api/content", async (req, res) => {
-  const { search, sources, tags, novelty_bucket } = req.query;
+  const { search, sources, tags, novelty_bucket, order_by } = req.query;
   const limit = parseInt(req.query.limit) || 50; // Default limit to 50
   const offset = parseInt(req.query.offset) || 0; // Default offset to 0
 
@@ -260,7 +260,12 @@ app.get("/api/content", async (req, res) => {
     query += " WHERE " + conditions.join(" AND "); // filters here
   }
 
-  query += " ORDER BY published_date DESC";
+  // Determine the ORDER BY clause
+  if (order_by === "random") {
+    query += " ORDER BY RANDOM()"; // <-- Add random ordering
+  } else {
+    query += " ORDER BY published_date DESC"; // Default ordering
+  }
 
   // Add LIMIT and OFFSET for pagination
   const limitParamIndex = finalParams.length + 1;
