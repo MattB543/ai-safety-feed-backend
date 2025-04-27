@@ -5,6 +5,7 @@ require("dotenv").config();
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const { Parser } = require("json2csv");
+const fs = require("fs");
 
 const { GoogleGenAI } = require("@google/genai");
 
@@ -30,14 +31,44 @@ app.use(limiter);
 const PORT = process.env.PORT || 8000;
 
 // Database setup
+console.log("Attempting DB connection...");
+console.log(
+  "Using DB URL from env:",
+  process.env.PG_URL ? "Loaded" : "MISSING or undefined!"
+); // Check if the env var is loaded
+
+let caCert;
+const caPath = __dirname + "/ca-certificate.crt";
+caCert = fs.readFileSync(caPath).toString();
+
+// Now create the pool using the loaded cert
 const pool = new Pool({
-  connectionString: process.env.SUPABASE_URL,
-  // ssl: { rejectUnauthorized: false } // Uncomment if needed
+  connectionString: process.env.PG_URL,
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
 // Add error handler for the pool
 pool.on("error", (err) => {
-  console.error("Unexpected error on database client", err);
+  // Add more detail to the pool error logging
+  console.error("Unexpected error on idle database client", err.message);
+  console.error("Error Code:", err.code); // Log the specific error code if available
+  // console.error(err.stack); // Uncomment for full stack trace if needed
+});
+
+// Try a simple connection test right after pool creation (optional but helpful)
+pool.connect((err, client, release) => {
+  if (err) {
+    console.error("FATAL: Initial database connection failed:", err.message);
+    console.error("Error Code:", err.code);
+    // console.error(err.stack); // Uncomment for full stack trace
+    // Consider exiting if the initial connection fails
+    // process.exit(1);
+  } else {
+    console.log("Initial database connection successful!");
+    client.release(); // Release the client back to the pool
+  }
 });
 
 // Middleware to parse JSON
