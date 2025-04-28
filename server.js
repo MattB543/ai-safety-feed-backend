@@ -257,20 +257,29 @@ app.get("/api/content", async (req, res) => {
   if (novelty_bucket) {
     const bucket = parseInt(novelty_bucket);
     let minScore = 0;
+    let maxScore = 100;
     switch (bucket) {
       case 2:
         minScore = 21;
+        maxScore = 40;
         break;
       case 3:
         minScore = 41;
+        maxScore = 70;
         break;
       case 4:
         minScore = 71;
+        maxScore = 80;
         break;
       case 5:
-        minScore = 91;
+        minScore = 81;
+        maxScore = 100;
         break;
-      // case 1 and default: minScore = 0 (no filter needed for >= 0)
+      // case 1 and default: minScore = 0, maxScore = 20
+      case 1:
+        minScore = 0;
+        maxScore = 20;
+        break;
     }
 
     // Only add the condition if minScore > 0
