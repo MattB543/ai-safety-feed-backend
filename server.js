@@ -146,7 +146,7 @@ function buildRerankPrompt(ref, candidates) {
   ${candBlocks}
 
   TASK
-  Based on semantic similarity (considering topics, summaries, implications, etc.), return a JSON array only with 5 to 10 candidate IDs, ordered most similar to least similar when compared to the REFERENCE ARTICLE.
+  Based on semantic similarity (considering topics, summaries, implications, etc.), return a JSON array only with 10 to 15 candidate IDs, ordered most similar to least similar when compared to the REFERENCE ARTICLE.
   Ensure the output is only the JSON array (e.g., ["id1", "id2", ...]) with no other text, commentary, or formatting like back-ticks.
   `.trim();
 }
@@ -318,7 +318,43 @@ app.get("/api/content", async (req, res) => {
   }
 });
 
+// NEW endpoint to fetch multiple posts by a list of IDs
+app.get("/api/content/by-ids", async (req, res) => {
+  const { ids } = req.query;
+
+  if (!ids) {
+    return res.status(400).json({ error: "Missing 'ids' query parameter" });
+  }
+
+  // Split the comma-separated string and convert to numbers, filtering out invalid entries
+  const idList = ids
+    .split(",")
+    .map((id) => parseInt(id.trim()))
+    .filter((id) => !isNaN(id) && id > 0);
+
+  if (idList.length === 0) {
+    // Handle cases where no valid IDs were provided after filtering
+    return res
+      .status(400)
+      .json({ error: "No valid IDs provided in 'ids' query parameter" });
+  }
+
+  try {
+    // Use ANY operator for efficient querying with an array of IDs
+    const query = "SELECT * FROM content WHERE id = ANY($1::int[])";
+    const { rows } = await pool.query(query, [idList]);
+
+    // Return the found posts. It might be an empty array if none of the IDs matched.
+    res.json(rows);
+  } catch (err) {
+    console.error("Error fetching content by IDs:", err);
+    console.error("Query Parameters (parsed):", idList); // Log the parsed IDs
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // NEW endpoint to fetch a single post by ID
+// NOTE: This must come *after* /api/content/by-ids to avoid conflict
 app.get("/api/content/:id", async (req, res) => {
   try {
     const {
@@ -357,135 +393,257 @@ app.get("/api/content/export", async (_req, res) => {
   }
 });
 
-app.get("/api/similar/:id", async (req, res) => {
+// Helper function to find vector similar candidates
+async function findVectorSimilarCandidates(id, k) {
+  console.log(`[findVectorSimilarCandidates/${id}] Fetching reference post...`);
+  const {
+    rows: [ref],
+  } = await pool.query(
+    "SELECT * FROM content WHERE id=$1 AND embedding_short IS NOT NULL AND embedding_full IS NOT NULL",
+    [id]
+  );
+  if (!ref) {
+    console.log(
+      `[findVectorSimilarCandidates/${id}] Reference post not found.`
+    );
+    return { ref: null, candidates: [], error: "Post not found", status: 404 };
+  }
+  console.log(
+    `[findVectorSimilarCandidates/${id}] Found reference post: ${ref.title}`
+  );
+
+  // pgvector nearest-neighbour union
+  console.log(
+    `[findVectorSimilarCandidates/${id}] Fetching ${k} candidates via vector search...`
+  );
+  const { rows: cands } = await pool.query(
+    `
+      (SELECT *, embedding_short <=> $1 AS dist
+        FROM content
+        WHERE id <> $3
+    ORDER BY embedding_short <=> $1
+        LIMIT $2)
+      UNION
+      (SELECT *, embedding_full  <=> $4 AS dist
+        FROM content
+        WHERE id <> $3
+    ORDER BY embedding_full  <=> $4
+        LIMIT $2)
+      `,
+    [ref.embedding_short, k, id, ref.embedding_full]
+  );
+  console.log(
+    `[findVectorSimilarCandidates/${id}] Found ${cands.length} candidates.`
+  );
+
+  // Deduplicate candidates based on ID, keeping the first occurrence
+  const uniqueCandsMap = new Map();
+  cands.forEach((cand) => {
+    if (!uniqueCandsMap.has(cand.id)) {
+      uniqueCandsMap.set(cand.id, cand);
+    }
+  });
+  const uniqueCands = Array.from(uniqueCandsMap.values());
+  console.log(
+    `[findVectorSimilarCandidates/${id}] Deduplicated to ${uniqueCands.length} unique candidates.`
+  );
+
+  return { ref, candidates: uniqueCands, error: null, status: 200 };
+}
+
+// --- Endpoint for Vector-Only Similar Posts ---
+app.get("/api/similar/:id/vector", async (req, res) => {
   const { id } = req.params;
-  const k = 15; // candidates
-  const n = 10; // final results
-  console.log(`[similar/${id}] START: k=${k}, n=${n}`);
+  const k = 20; // Initial candidates to fetch
+  const n = 20; // Final results to return
+  console.log(`[similar/${id}/vector] START: k=${k}, n=${n}`);
 
   try {
-    // 1. reference row + embeddings
-    console.log(`[similar/${id}] Fetching reference post...`);
-    const {
-      rows: [ref],
-    } = await pool.query(
-      "SELECT * FROM content WHERE id=$1 AND embedding_short IS NOT NULL AND embedding_full IS NOT NULL",
-      [id]
-    );
-    if (!ref) {
-      console.log(`[similar/${id}] Reference post not found.`);
-      return res.status(404).json({ error: "Post not found" });
+    const { ref, candidates, error, status } =
+      await findVectorSimilarCandidates(id, k);
+
+    if (error) {
+      return res.status(status).json({ error });
     }
-    console.log(`[similar/${id}] Found reference post: ${ref.title}`);
 
-    // 2. pgvector nearest-neighbour union
+    // Sort by distance and take top n
+    const sortedCandidates = candidates
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, n);
+    const finalIds = sortedCandidates.map((c) => c.id);
+
     console.log(
-      `[similar/${id}] Fetching ${k} candidates via vector search...`
+      `[similar/${id}/vector] Top ${n} vector IDs: ${JSON.stringify(finalIds)}`
     );
-    const { rows: cands } = await pool.query(
-      `
-        (SELECT *, embedding_short <=> $1 AS dist
-          FROM content
-          WHERE id <> $3
-      ORDER BY embedding_short <=> $1
-          LIMIT $2)
-        UNION
-        (SELECT *, embedding_full  <=> $4 AS dist
-          FROM content
-          WHERE id <> $3
-      ORDER BY embedding_full  <=> $4
-          LIMIT $2)
-        `,
-      [ref.embedding_short, k, id, ref.embedding_full]
-    );
-    console.log(`[similar/${id}] Found ${cands.length} candidates.`);
 
-    // Deduplicate candidates based on ID, keeping the first occurrence
-    const uniqueCandsMap = new Map();
-    cands.forEach((cand) => {
-      if (!uniqueCandsMap.has(cand.id)) {
-        uniqueCandsMap.set(cand.id, cand);
-      }
-    });
-    const uniqueCands = Array.from(uniqueCandsMap.values());
+    // Fetch full details for the final IDs, preserving order
+    if (finalIds.length === 0) {
+      console.log(`[similar/${id}/vector] No similar posts found.`);
+      return res.json([]);
+    }
+
+    const numericFinalIds = finalIds.map(Number);
+    const { rows: finals } = await pool.query(
+      "SELECT * FROM content WHERE id = ANY($1::int[])",
+      [numericFinalIds]
+    );
     console.log(
-      `[similar/${id}] Deduplicated to ${uniqueCands.length} unique candidates.`
+      `[similar/${id}/vector] Found ${finals.length} posts in DB matching final IDs.`
     );
 
-    /* ---------- 3. Gemini re-rank (optional) ---------- */
-    let finalIds;
-    if (genAI && GEMINI_MODEL) {
+    const ordered = finalIds
+      .map((fid) => finals.find((r) => r.id === Number(fid)))
+      .filter(Boolean);
+    console.log(
+      `[similar/${id}/vector] Returning ${ordered.length} ordered posts.`
+    );
+
+    res.json(ordered);
+  } catch (err) {
+    console.error(`[similar/${id}/vector] Error in route:`, err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// --- Endpoint for AI Re-ranked Similar Posts ---
+app.get("/api/similar/:id/ai", async (req, res) => {
+  const { id } = req.params;
+  const k = 20; // candidates for AI rerank
+  const n = 20; // final results
+  console.log(`[similar/${id}/ai] START: k=${k}, n=${n}`);
+
+  try {
+    // 1. Get reference and candidates using the helper
+    const {
+      ref,
+      candidates: uniqueCands,
+      error,
+      status,
+    } = await findVectorSimilarCandidates(id, k);
+
+    if (error) {
+      return res.status(status).json({ error });
+    }
+
+    /* ---------- 2. Gemini re-rank ---------- */
+    let finalIds = [];
+    if (genAI && GEMINI_MODEL && uniqueCands.length > 0) {
       const prompt = buildRerankPrompt(ref, uniqueCands);
       console.log(
-        `[similar/${id}] Sending prompt to Gemini for reranking ${uniqueCands.length} candidates down to ${n}...`
+        `[similar/${id}/ai] Sending prompt to Gemini for reranking ${uniqueCands.length} candidates down to ${n}...`
       );
-      console.log(`[similar/${id}] Gemini Prompt:\n${prompt}`); // Uncomment for full prompt
-      const resp = await genAI.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.1,
-          responseMimeType: "application/json",
-        },
-      });
+      // console.log(`[similar/${id}/ai] Gemini Prompt:\n${prompt}`); // Uncomment for full prompt
 
       try {
-        console.log("Response:", resp);
+        const resp = await genAI.models.generateContent({
+          model: GEMINI_MODEL,
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.1,
+            responseMimeType: "application/json",
+          },
+        });
+
+        // console.log("Gemini Response Object:", JSON.stringify(resp, null, 2)); // Log the full response object for debugging
         const geminiResponseText = resp.candidates[0].content.parts[0].text;
         console.log(
-          `[similar/${id}] Gemini raw response: ${geminiResponseText}`
+          `[similar/${id}/ai] Gemini raw response: ${geminiResponseText}`
         );
-        // Extract the JSON array part
-        const jsonMatch = geminiResponseText.match(/\[.*\]/s);
-        if (jsonMatch && jsonMatch[0]) {
-          finalIds = JSON.parse(jsonMatch[0]);
+
+        // Extract the JSON array part robustly
+        const jsonMatch = geminiResponseText.match(/(\[[\s\S]*?\])/); // More robust regex to find the array
+        if (jsonMatch && jsonMatch[1]) {
+          finalIds = JSON.parse(jsonMatch[1]);
+          // Ensure we only take up to 'n' results from AI
+          if (finalIds.length > n) {
+            console.warn(
+              `[similar/${id}/ai] Gemini returned ${finalIds.length} IDs, truncating to ${n}.`
+            );
+            finalIds = finalIds.slice(0, n);
+          }
           console.log(
-            `[similar/${id}] Parsed Gemini IDs: ${JSON.stringify(finalIds)}`
+            `[similar/${id}/ai] Parsed Gemini IDs (${
+              finalIds.length
+            }): ${JSON.stringify(finalIds)}`
           );
         } else {
-          throw new Error("No valid JSON array found in Gemini response");
+          console.warn(
+            `[similar/${id}/ai] No valid JSON array found in Gemini response: "${geminiResponseText}"`
+          );
+          // Fallback will be triggered below
         }
       } catch (e) {
-        console.warn(
-          `[similar/${id}] Gemini JSON parse failed, falling back to vector order:`,
+        console.error(
+          `[similar/${id}/ai] Gemini call or JSON parse failed:`,
           e
         );
+        // Fallback will be triggered below
       }
+    } else if (uniqueCands.length === 0) {
+      console.log(`[similar/${id}/ai] No candidates found for AI reranking.`);
     } else {
       console.log(
-        `[similar/${id}] Gemini client or model not configured, skipping rerank.`
+        `[similar/${id}/ai] Gemini client/model not configured or no candidates, skipping rerank.`
       );
     }
 
-    // 4. fallback or use vector order if Gemini missing / failed
+    // 3. Fallback or use vector order if Gemini missing / failed / no candidates initially
     if (!Array.isArray(finalIds) || finalIds.length === 0) {
-      console.log(`[similar/${id}] Using fallback vector similarity order.`);
-      // Use uniqueCands for fallback as well
-      finalIds = uniqueCands
-        .sort((a, b) => a.dist - b.dist)
-        .slice(0, n)
-        .map((r) => r.id);
-      console.log(`[similar/${id}] Fallback IDs: ${JSON.stringify(finalIds)}`);
+      if (uniqueCands.length > 0) {
+        console.log(
+          `[similar/${id}/ai] Using fallback vector similarity order.`
+        );
+        finalIds = uniqueCands
+          .sort((a, b) => a.dist - b.dist) // Sort by distance
+          .slice(0, n) // Take top n
+          .map((r) => r.id); // Get IDs
+        console.log(
+          `[similar/${id}/ai] Fallback IDs (${
+            finalIds.length
+          }): ${JSON.stringify(finalIds)}`
+        );
+      } else {
+        console.log(
+          `[similar/${id}/ai] No candidates for fallback, returning empty.`
+        );
+        finalIds = [];
+      }
     }
 
-    // 5. fetch rows & preserve order
-    console.log(`[similar/${id}] Fetching final ${finalIds.length} posts...`);
-    const numericFinalIds = finalIds.map(Number); // Convert string IDs to numbers
+    // 4. Fetch final rows & preserve order
+    if (finalIds.length === 0) {
+      console.log(`[similar/${id}/ai] No final IDs to fetch, returning empty.`);
+      return res.json([]);
+    }
+
+    console.log(
+      `[similar/${id}/ai] Fetching final ${finalIds.length} posts...`
+    );
+    const numericFinalIds = finalIds.map(String).map(Number); // Ensure IDs are numbers for query
     const { rows: finals } = await pool.query(
       "SELECT * FROM content WHERE id = ANY($1::int[])",
       [numericFinalIds] // Use the numeric array
     );
     console.log(
-      `[similar/${id}] Found ${finals.length} posts in DB matching final IDs.`
+      `[similar/${id}/ai] Found ${finals.length} posts in DB matching final IDs.`
     );
+
     const ordered = finalIds
       .map((fid) => finals.find((r) => r.id === Number(fid))) // Compare with numeric ID
-      .filter(Boolean);
-    console.log(`[similar/${id}] Returning ${ordered.length} ordered posts.`);
+      .filter(Boolean); // Remove any potential nulls if an ID wasn't found
 
+    if (ordered.length !== finalIds.length) {
+      console.warn(
+        `[similar/${id}/ai] Mismatch between final IDs (${finalIds.length}) and fetched posts (${ordered.length}). Some IDs might be invalid or missing.`
+      );
+    }
+
+    console.log(
+      `[similar/${id}/ai] Returning ${ordered.length} ordered posts.`
+    );
     res.json(ordered);
   } catch (err) {
-    console.error(`[similar/${id}] Error in route:`, err);
+    console.error(`[similar/${id}/ai] Error in route:`, err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
