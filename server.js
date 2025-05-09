@@ -198,18 +198,18 @@ function generateDigestHtml(subscription, newContent) {
       let tagsHtml = "";
       const tagParts = [];
       if (item.cluster_tag) {
-        tagParts.push(`Cluster: ${escapeHtml(item.cluster_tag)}`);
+        tagParts.push(`${escapeHtml(item.cluster_tag)}`);
       }
       if (item.topics && Array.isArray(item.topics) && item.topics.length > 0) {
         const topicsToShow = item.topics
           .slice(0, 3)
           .map((topic) => escapeHtml(topic))
           .join(", ");
-        tagParts.push(`Topics: ${topicsToShow}`);
+        tagParts.push(`${topicsToShow}`);
       }
       if (tagParts.length > 0) {
         tagsHtml = `<p style="font-size: 0.9em; color: #666; margin: 0 0 5px 0;">Tags: ${tagParts.join(
-          " | "
+          "  |  "
         )}</p>`;
       }
 
@@ -236,7 +236,7 @@ function generateDigestHtml(subscription, newContent) {
       const publishedDateFormatted = new Date(
         item.published_date
       ).toLocaleDateString();
-      const bottomLineHtml = `<p style="font-size: 0.8em; color: #888; margin: 0;">Published: ${publishedDateFormatted}  |  <a href="${viewSimilarPostsUrl}" style="color: #007bff; text-decoration: none;">View similar posts</a></p>`;
+      const bottomLineHtml = `<p style="font-size: 0.8em; color: #888; margin: 0;">Published: ${publishedDateFormatted}  |  <a href="${viewSimilarPostsUrl}" style="color: #007bff; text-decoration: none;">View details & similar posts</a></p>`;
 
       return `
         <div style="${itemContainerStyle}">
