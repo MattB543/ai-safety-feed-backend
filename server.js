@@ -10,10 +10,11 @@ const postmark = require("postmark");
 const { v4: uuidv4 } = require("uuid");
 const cron = require("node-cron"); // Import node-cron
 
-const { GoogleGenAI } = require("@google/genai");
-
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const GEMINI_MODEL = "gemini-2.5-flash-preview-04-17";
+const OpenAI = require("openai");
+const openai = new OpenAI({
+  apiKey: process.env.OPEN_AI_FREE_CREDITS_KEY,
+});
+const GPT_MODEL = "gpt-4.1";
 
 // Initialize Postmark Client
 let postmarkClient;
@@ -674,60 +675,6 @@ async function findVectorSimilarCandidates(id, k) {
   return { ref, candidates: uniqueCands, error: null, status: 200 };
 }
 
-// --- Endpoint for Vector-Only Similar Posts ---
-app.get("/api/similar/:id/vector", async (req, res) => {
-  const { id } = req.params;
-  const k = 20; // Initial candidates to fetch
-  const n = 20; // Final results to return
-  console.log(`[similar/${id}/vector] START: k=${k}, n=${n}`);
-
-  try {
-    const { ref, candidates, error, status } =
-      await findVectorSimilarCandidates(id, k);
-
-    if (error) {
-      return res.status(status).json({ error });
-    }
-
-    // Sort by distance and take top n
-    const sortedCandidates = candidates
-      .sort((a, b) => a.dist - b.dist)
-      .slice(0, n);
-    const finalIds = sortedCandidates.map((c) => c.id);
-
-    console.log(
-      `[similar/${id}/vector] Top ${n} vector IDs: ${JSON.stringify(finalIds)}`
-    );
-
-    // Fetch full details for the final IDs, preserving order
-    if (finalIds.length === 0) {
-      console.log(`[similar/${id}/vector] No similar posts found.`);
-      return res.json([]);
-    }
-
-    const numericFinalIds = finalIds.map(Number);
-    const { rows: finals } = await pool.query(
-      "SELECT * FROM content WHERE id = ANY($1::int[])",
-      [numericFinalIds]
-    );
-    console.log(
-      `[similar/${id}/vector] Found ${finals.length} posts in DB matching final IDs.`
-    );
-
-    const ordered = finalIds
-      .map((fid) => finals.find((r) => r.id === Number(fid)))
-      .filter(Boolean);
-    console.log(
-      `[similar/${id}/vector] Returning ${ordered.length} ordered posts.`
-    );
-
-    res.json(ordered);
-  } catch (err) {
-    console.error(`[similar/${id}/vector] Error in route:`, err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
 // --- Endpoint for AI Re-ranked Similar Posts ---
 app.get("/api/similar/:id/ai", async (req, res) => {
   const { id } = req.params;
@@ -750,49 +697,51 @@ app.get("/api/similar/:id/ai", async (req, res) => {
 
     /* ---------- 2. Gemini re-rank ---------- */
     let finalIds = [];
-    if (genAI && GEMINI_MODEL && uniqueCands.length > 0) {
+    if (openai && GPT_MODEL && uniqueCands.length > 0) {
       const prompt = buildRerankPrompt(ref, uniqueCands);
       console.log(
-        `[similar/${id}/ai] Sending prompt to Gemini for reranking ${uniqueCands.length} candidates down to ${n}...`
+        `[similar/${id}/ai] Sending prompt to OpenAI for reranking ${uniqueCands.length} candidates down to ${n}...`
       );
-      // console.log(`[similar/${id}/ai] Gemini Prompt:\n${prompt}`); // Uncomment for full prompt
+      // console.log(`[similar/${id}/ai] OpenAI Prompt:\n${prompt}`); // Uncomment for full prompt
 
       try {
-        const resp = await genAI.models.generateContent({
-          model: GEMINI_MODEL,
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.1,
-            responseMimeType: "application/json",
-          },
+        const resp = await openai.chat.completions.create({
+          model: GPT_MODEL,
+          temperature: 0.1,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a 'Post Similarity Ranking' service that returns ONLY a JSON array of candidate IDs.",
+            },
+            { role: "user", content: prompt },
+          ],
         });
-
-        // console.log("Gemini Response Object:", JSON.stringify(resp, null, 2)); // Log the full response object for debugging
-        const geminiResponseText = resp.candidates[0].content.parts[0].text;
+        const openaiResponseText = resp.choices[0].message.content;
         console.log(
-          `[similar/${id}/ai] Gemini raw response: ${geminiResponseText}`
+          `[similar/${id}/ai] OpenAI raw response: ${openaiResponseText}`
         );
 
         // Extract the JSON array part robustly
-        const jsonMatch = geminiResponseText.match(/(\[[\s\S]*?\])/); // More robust regex to find the array
+        const jsonMatch = openaiResponseText.match(/(\[[\s\S]*?\])/); // More robust regex to find the array
         if (jsonMatch && jsonMatch[1]) {
           try {
             finalIds = JSON.parse(jsonMatch[1]);
             // Ensure we only take up to 'n' results from AI
             if (finalIds.length > n) {
               console.warn(
-                `[similar/${id}/ai] Gemini returned ${finalIds.length} IDs, truncating to ${n}.`
+                `[similar/${id}/ai] OpenAI returned ${finalIds.length} IDs, truncating to ${n}.`
               );
               finalIds = finalIds.slice(0, n);
             }
             console.log(
-              `[similar/${id}/ai] Parsed Gemini IDs (${
+              `[similar/${id}/ai] Parsed OpenAI IDs (${
                 finalIds.length
               }): ${JSON.stringify(finalIds)}`
             );
           } catch (parseError) {
             console.error(
-              `[similar/${id}/ai] Failed to parse JSON from Gemini response: "${jsonMatch[1]}"`,
+              `[similar/${id}/ai] Failed to parse JSON from OpenAI response: "${jsonMatch[1]}"`,
               parseError
             );
             return res
@@ -801,13 +750,13 @@ app.get("/api/similar/:id/ai", async (req, res) => {
           }
         } else {
           console.warn(
-            `[similar/${id}/ai] No valid JSON array found in Gemini response: "${geminiResponseText}"`
+            `[similar/${id}/ai] No valid JSON array found in OpenAI response: "${openaiResponseText}"`
           );
           // Fallback will be triggered if no JSON array is found by the regex
         }
       } catch (e) {
         console.error(
-          `[similar/${id}/ai] Gemini call or JSON parse failed:`,
+          `[similar/${id}/ai] OpenAI call or JSON parse failed:`,
           e
         );
         // Fallback will be triggered below
@@ -816,11 +765,11 @@ app.get("/api/similar/:id/ai", async (req, res) => {
       console.log(`[similar/${id}/ai] No candidates found for AI reranking.`);
     } else {
       console.log(
-        `[similar/${id}/ai] Gemini client/model not configured or no candidates, skipping rerank.`
+        `[similar/${id}/ai] OpenAI client/model not configured or no candidates, skipping rerank.`
       );
     }
 
-    // 3. Fallback or use vector order if Gemini missing / failed / no candidates initially
+    // 3. Fallback or use vector order if OpenAI missing / failed / no candidates initially
     if (!Array.isArray(finalIds) || finalIds.length === 0) {
       if (uniqueCands.length > 0) {
         console.log(
