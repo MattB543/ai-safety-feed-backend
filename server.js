@@ -40,6 +40,45 @@ function escapeHtml(unsafe) {
     .replace(/'/g, "&#039;");
 }
 
+// Helper function to get display title (matching frontend logic)
+function getDisplayTitle(article) {
+  if (article.cleaned_title && article.cleaned_title !== article.title) {
+    return article.cleaned_title;
+  }
+  return article.title || "";
+}
+
+// Helper function to slugify text (matching frontend logic)
+function slugify(text) {
+  if (!text) {
+    return "no-title";
+  }
+
+  // Convert to string, lowercase, and trim
+  let slug = String(text).toLowerCase().trim();
+
+  // Replace spaces with hyphens
+  slug = slug.replace(/\s+/g, "-");
+
+  // Remove all non-word characters except hyphens
+  slug = slug.replace(/[^\w\-]+/g, "");
+
+  // Replace multiple hyphens with single hyphen
+  slug = slug.replace(/\-\-+/g, "-");
+
+  // Trim hyphens from start and end
+  slug = slug.replace(/^-+|-+$/g, "");
+
+  return slug;
+}
+
+// Helper function to generate similar page URL
+function generateSimilarUrl(article, baseUrl) {
+  const displayTitle = getDisplayTitle(article);
+  const slug = slugify(displayTitle);
+  return `${baseUrl}/similar/${slug}-${article.id}`;
+}
+
 const app = express();
 
 app.use(helmet());
@@ -231,7 +270,7 @@ function generateDigestHtml(subscription, newContent) {
         noveltyScoreHtml = `<p style="font-size: 0.9em; color: #555; margin: 5px 0 5px 0;">Novelty Score: ${noveltyBucket}/5</p>`;
       }
 
-      const viewSimilarPostsUrl = `${appBaseUrl}/post/${item.id}/similar`;
+      const viewSimilarPostsUrl = generateSimilarUrl(item, appBaseUrl);
 
       // 3. Combine Published Date and View Similar Link
       const publishedDateFormatted = new Date(
@@ -341,7 +380,7 @@ async function fetchContentForSubscription(subscription) {
   // --- End query condition building ---
 
   const contentQuery = `
-    SELECT id, title, source_url, sentence_summary, published_date, cluster_tag, topics, novelty_score, cleaned_title, cleaned_image
+    SELECT id, title, source_url, sentence_summary, published_date, cluster_tag, topics, novelty_score, cleaned_title, cleaned_image, image_prompt
     FROM content
     WHERE ${queryConditions.join(" AND ")}
     ORDER BY published_date DESC
@@ -503,7 +542,7 @@ app.get("/api/content", async (req, res) => {
     novelty_score, novelty_note,
     image_url, source_url, source_type,
     authors, topics, cluster_tag, published_date,
-    cleaned_title, cleaned_image
+    cleaned_title, cleaned_image, image_prompt
   FROM content`;
   if (conditions.length > 0) {
     // Join conditions with AND, prepending WHERE
@@ -560,8 +599,7 @@ app.get("/api/content/by-ids", async (req, res) => {
 
   try {
     // Use ANY operator for efficient querying with an array of IDs
-    const query =
-      "SELECT *, cleaned_title, cleaned_image FROM content WHERE id = ANY($1::int[])";
+    const query = "SELECT * FROM content WHERE id = ANY($1::int[])";
     const { rows } = await pool.query(query, [idList]);
 
     // Return the found posts. It might be an empty array if none of the IDs matched.
@@ -601,10 +639,7 @@ app.get("/api/content/:id", async (req, res) => {
   try {
     const {
       rows: [post],
-    } = await pool.query(
-      "SELECT *, cleaned_title, cleaned_image FROM content WHERE id=$1",
-      [req.params.id]
-    );
+    } = await pool.query("SELECT * FROM content WHERE id=$1", [req.params.id]);
     if (post) {
       res.json(post);
     } else {
@@ -622,7 +657,7 @@ async function findVectorSimilarCandidates(id, k) {
   const {
     rows: [ref],
   } = await pool.query(
-    "SELECT *, cleaned_title, cleaned_image FROM content WHERE id=$1 AND embedding_short IS NOT NULL AND embedding_full IS NOT NULL",
+    "SELECT * FROM content WHERE id=$1 AND embedding_short IS NOT NULL AND embedding_full IS NOT NULL",
     [id]
   );
   if (!ref) {
@@ -641,13 +676,13 @@ async function findVectorSimilarCandidates(id, k) {
   );
   const { rows: cands } = await pool.query(
     `
-      (SELECT *, cleaned_title, cleaned_image, embedding_short <=> $1 AS dist
+      (SELECT *, embedding_short <=> $1 AS dist
         FROM content
         WHERE id <> $3 AND embedding_short IS NOT NULL
     ORDER BY embedding_short <=> $1
         LIMIT $2)
       UNION ALL
-      (SELECT *, cleaned_title, cleaned_image, embedding_full  <=> $4 AS dist
+      (SELECT *, embedding_full  <=> $4 AS dist
         FROM content
         WHERE id <> $3 AND embedding_full IS NOT NULL
     ORDER BY embedding_full  <=> $4
@@ -803,7 +838,7 @@ app.get("/api/similar/:id/ai", async (req, res) => {
     );
     const numericFinalIds = finalIds.map(String).map(Number); // Ensure IDs are numbers for query
     const { rows: finals } = await pool.query(
-      "SELECT *, cleaned_title, cleaned_image FROM content WHERE id = ANY($1::int[])",
+      "SELECT * FROM content WHERE id = ANY($1::int[])",
       [numericFinalIds] // Use the numeric array
     );
     console.log(
