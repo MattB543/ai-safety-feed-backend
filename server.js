@@ -72,6 +72,83 @@ function slugify(text) {
   return slug;
 }
 
+// Helper function to calculate read time from markdown content
+function calculateReadTime(markdownContent) {
+  if (!markdownContent) return null;
+
+  // Remove markdown syntax for more accurate word count
+  const plainText = markdownContent
+    .replace(/```[\s\S]*?```/g, "") // Remove code blocks
+    .replace(/`.*?`/g, "") // Remove inline code
+    .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1") // Replace links with text
+    .replace(/[#*_~>\-]/g, "") // Remove markdown symbols
+    .replace(/\s+/g, " ") // Normalize whitespace
+    .trim();
+
+  const wordCount = plainText.split(/\s+/).length;
+  const wordsPerMinute = 200; // Average reading speed
+  const minutes = Math.ceil(wordCount / wordsPerMinute);
+
+  return minutes;
+}
+
+// Helper function to get source type text label
+function getSourceTypeText(sourceType) {
+  if (!sourceType) return "Blog Post";
+
+  const type = sourceType.toLowerCase();
+
+  // Explicit mappings for all your source types
+  const sourceTypeMap = {
+    // Forum Posts
+    "ea forum": "Forum Post",
+    "less wrong": "Forum Post",
+    "alignment forum": "Forum Post",
+
+    // Podcasts
+    "techtank podcast": "Podcast",
+    "ai governance podcast": "Podcast",
+    "80,000 hours podcast": "Podcast",
+    axrp: "Podcast",
+    "machine ethics podcast": "Podcast",
+    "dwarkesh podcast": "Podcast",
+    "for humanity: an ai safety podcast": "Podcast",
+    "machine learning street talk": "Podcast",
+    "clearer thinking": "Podcast",
+    "into ai safety": "Podcast",
+    "ai, government, and the future": "Podcast",
+
+    // Blog Posts
+    "don't worry about the vase": "Blog Post",
+    "musings on the alignment problem": "Blog Post",
+    "miles's substack": "Blog Post",
+    "joe carlsmith's substack": "Blog Post",
+    "rising tide": "Blog Post",
+    "epoch ai": "Blog Post",
+    "enterprise ai governance": "Blog Post",
+    "agi friday": "Blog Post",
+    "ai frontiers": "Blog Post",
+    hyperdimensional: "Blog Post",
+    "ml safety newsletter": "Blog Post",
+    "ai safety newsletter": "Blog Post",
+    "the eu ai act newsletter": "Blog Post",
+  };
+
+  // Check exact match first
+  if (sourceTypeMap[type]) {
+    return sourceTypeMap[type];
+  }
+
+  // Fallback to keyword matching for any new sources
+  if (type.includes("podcast")) return "Podcast";
+  if (type.includes("forum")) return "Forum Post";
+  if (type.includes("substack")) return "Blog Post";
+  if (type.includes("newsletter")) return "Blog Post";
+
+  // Default to Blog Post
+  return "Blog Post";
+}
+
 // Helper function to generate similar page URL
 function generateSimilarUrl(article, baseUrl) {
   const displayTitle = getDisplayTitle(article);
@@ -227,84 +304,219 @@ function generateDigestHtml(subscription, newContent) {
 
   const unsubscribeUrl = `${appBaseUrl}/api/unsubscribe/${subscription.unsubscribe_token}`;
 
-  const itemsHtml = newContent
-    .map((item, index) => {
-      const isLastItem = index === newContent.length - 1;
-      const itemContainerStyle = `margin-bottom: 15px; padding-bottom: 10px; ${
-        !isLastItem ? "border-bottom: 1px solid #eee;" : ""
-      }`;
+  // Calculate summary stats
+  const stats = newContent.reduce((acc, item) => {
+    const sourceTypeText = getSourceTypeText(item.source_type);
 
-      // 1. Combine Cluster and Topic Tags
-      let tagsHtml = "";
-      const tagParts = [];
-      if (item.cluster_tag) {
-        tagParts.push(`${escapeHtml(item.cluster_tag)}`);
+    if (sourceTypeText === "Podcast") {
+      acc.podcasts = (acc.podcasts || 0) + 1;
+    } else if (sourceTypeText === "Forum Post") {
+      acc.forumPosts = (acc.forumPosts || 0) + 1;
+    } else if (sourceTypeText === "Blog Post") {
+      acc.blogPosts = (acc.blogPosts || 0) + 1;
+    }
+    return acc;
+  }, {});
+
+  const statsParts = [];
+  if (stats.forumPosts > 0)
+    statsParts.push(
+      `${stats.forumPosts} forum post${stats.forumPosts > 1 ? "s" : ""}`
+    );
+  if (stats.blogPosts > 0)
+    statsParts.push(
+      `${stats.blogPosts} blog post${stats.blogPosts > 1 ? "s" : ""}`
+    );
+  if (stats.podcasts > 0)
+    statsParts.push(
+      `${stats.podcasts} podcast${stats.podcasts > 1 ? "s" : ""}`
+    );
+
+  const statsHtml =
+    statsParts.length > 0
+      ? `<p style="font-size: 1em; color: #666; margin: 10px 0 20px 0; padding: 10px; background-color: #f8f9fa; border-radius: 5px;">
+      ${
+        subscription.frequency === "weekly" ? "This week's" : "Today's"
+      } digest includes: ${statsParts.join(", ")}
+    </p>`
+      : "";
+
+  // Helper function to render individual item
+  function renderItem(item, index, isLastInGroup = false) {
+    const itemContainerStyle = `margin-bottom: 15px; padding-bottom: 20px; ${
+      !isLastInGroup ? "border-bottom: 1px solid #eee;" : ""
+    }`;
+
+    // Use cleaned_title if available
+    const displayTitle = getDisplayTitle(item);
+
+    // Calculate read time
+    const readTime = calculateReadTime(item.full_content_markdown);
+    const readTimeText = readTime ? `${readTime} min read` : "";
+
+    // Add image if available (with safety checks)
+    // For weekly digests, only show images for high novelty posts to manage email size
+    const imageUrl = item.cleaned_image || item.image_url;
+    const shouldShowImage =
+      imageUrl &&
+      (subscription.frequency === "daily" ||
+        (item.novelty_score && item.novelty_score >= 71)); // Only show images for novelty 4-5 in weekly
+    const imageHtml = shouldShowImage
+      ? `<img src="${escapeHtml(imageUrl)}" 
+            alt="${escapeHtml(item.image_prompt || displayTitle)}" 
+            style="width: 100%; max-width: 150px; height: auto; margin: 10px 0; border-radius: 8px;"
+            width="150">`
+      : "";
+
+    // Create metadata line (source category | source_type | published date | read time) - goes below title
+    const publishedDateFormatted = new Date(
+      item.published_date
+    ).toLocaleDateString();
+    const metadataParts = [];
+
+    if (item.source_type) {
+      const sourceTypeText = getSourceTypeText(item.source_type);
+      metadataParts.push(
+        `${sourceTypeText}&nbsp;&nbsp;|&nbsp;&nbsp;${item.source_type}`
+      );
+    }
+    metadataParts.push(`${publishedDateFormatted}`);
+    if (readTimeText) {
+      metadataParts.push(readTimeText);
+    }
+
+    const metadataHtml =
+      metadataParts.length > 0
+        ? `<p style="font-size: 0.9em; color: #888; margin: 5px 0 10px 0;">${metadataParts.join(
+            "&nbsp;&nbsp;|&nbsp;&nbsp;"
+          )}</p>`
+        : "";
+
+    // 1. Combine Cluster and Topic Tags - now using metadata styling
+    let tagsHtml = "";
+    const tagParts = [];
+    if (item.cluster_tag) {
+      tagParts.push(`${escapeHtml(item.cluster_tag)}`);
+    }
+    if (item.topics && Array.isArray(item.topics) && item.topics.length > 0) {
+      const topicsToShow = item.topics
+        .slice(0, 3)
+        .map((topic) => escapeHtml(topic))
+        .join(", ");
+      tagParts.push(`${topicsToShow}`);
+    }
+    if (tagParts.length > 0) {
+      tagsHtml = `<p style="font-size: 0.9em; color: #888; margin: 0 0 5px 0;">${tagParts.join(
+        "&nbsp;&nbsp;|&nbsp;&nbsp;"
+      )}</p>`;
+    }
+
+    // 2. Create novelty score and similar post link - using metadata styling
+    let noveltyAndLinkHtml = "";
+    const noveltyAndLinkParts = [];
+
+    // Add novelty score
+    if (item.novelty_score !== null && item.novelty_score !== undefined) {
+      let noveltyBucket = 1; // Default to 1 (0-20)
+      const score = item.novelty_score;
+      if (score >= 91) {
+        noveltyBucket = 5;
+      } else if (score >= 71) {
+        noveltyBucket = 4;
+      } else if (score >= 41) {
+        noveltyBucket = 3;
+      } else if (score >= 21) {
+        noveltyBucket = 2;
       }
-      if (item.topics && Array.isArray(item.topics) && item.topics.length > 0) {
-        const topicsToShow = item.topics
-          .slice(0, 3)
-          .map((topic) => escapeHtml(topic))
-          .join(", ");
-        tagParts.push(`${topicsToShow}`);
-      }
-      if (tagParts.length > 0) {
-        tagsHtml = `<p style="font-size: 0.9em; color: #666; margin: 0 0 5px 0;">Tags: ${tagParts.join(
-          "  |  "
-        )}</p>`;
-      }
+      noveltyAndLinkParts.push(`Novelty Score: ${noveltyBucket}/5`);
+    }
 
-      // 2. Bucket Novelty Score
-      let noveltyScoreHtml = "";
-      if (item.novelty_score !== null && item.novelty_score !== undefined) {
-        let noveltyBucket = 1; // Default to 1 (0-20)
-        const score = item.novelty_score;
-        if (score >= 91) {
-          noveltyBucket = 5;
-        } else if (score >= 71) {
-          noveltyBucket = 4;
-        } else if (score >= 41) {
-          noveltyBucket = 3;
-        } else if (score >= 21) {
-          noveltyBucket = 2;
-        }
-        noveltyScoreHtml = `<p style="font-size: 0.9em; color: #555; margin: 5px 0 5px 0;">Novelty Score: ${noveltyBucket}/5</p>`;
-      }
+    // Add similar post link
+    const viewSimilarPostsUrl = generateSimilarUrl(item, appBaseUrl);
+    noveltyAndLinkParts.push(
+      `<a href="${viewSimilarPostsUrl}" style="color: #007bff; text-decoration: none;">View details & similar posts</a>`
+    );
 
-      const viewSimilarPostsUrl = generateSimilarUrl(item, appBaseUrl);
+    if (noveltyAndLinkParts.length > 0) {
+      noveltyAndLinkHtml = `<p style="font-size: 0.9em; color: #888; margin: 5px 0 0 0;">${noveltyAndLinkParts.join(
+        "&nbsp;&nbsp;|&nbsp;&nbsp;"
+      )}</p>`;
+    }
 
-      // 3. Combine Published Date and View Similar Link
-      const publishedDateFormatted = new Date(
-        item.published_date
-      ).toLocaleDateString();
-      const bottomLineHtml = `<p style="font-size: 0.8em; color: #888; margin: 0;">Published: ${publishedDateFormatted}  |  <a href="${viewSimilarPostsUrl}" style="color: #007bff; text-decoration: none;">View details & similar posts</a></p>`;
+    return `
+      <div style="${itemContainerStyle}">
+        <h3 style="margin-bottom: 5px; font-size: 1.3em;"><a href="${
+          item.source_url
+        }" style="color: #007bff; text-decoration: none;">${escapeHtml(
+      displayTitle
+    )}</a></h3>
+        ${metadataHtml}
+        ${tagsHtml}
+        ${imageHtml}
+        <p style="font-size: 1.1em; color: #333; margin: 0 0 5px 0; line-height: 1.5;">${
+          escapeHtml(item.sentence_summary) || "No summary available."
+        }</p>
+        ${noveltyAndLinkHtml}
+      </div>
+    `;
+  }
 
-      return `
-        <div style="${itemContainerStyle}">
-          <h3 style="margin-bottom: 5px;"><a href="${
-            item.source_url
-          }" style="color: #007bff; text-decoration: none;">${escapeHtml(
-        item.title
-      )}</a></h3>
-          ${tagsHtml}
-          <p style="font-size: 0.95em; color: #333; margin: 0 0 5px 0;">${
-            escapeHtml(item.sentence_summary) || "No summary available."
-          }</p>
-          ${noveltyScoreHtml}
-          ${bottomLineHtml}
-        </div>
-      `;
-    })
-    .join("");
+  // Group content by source for weekly digests
+  let itemsHtml = "";
+
+  if (subscription.frequency === "weekly") {
+    // Group by source_type
+    const grouped = newContent.reduce((acc, item) => {
+      const source = item.source_type || "Other";
+      if (!acc[source]) acc[source] = [];
+      acc[source].push(item);
+      return acc;
+    }, {});
+
+    // Process each group
+    const sortedSources = Object.keys(grouped).sort();
+
+    itemsHtml = sortedSources
+      .map((source) => {
+        const items = grouped[source];
+        const needsHeader =
+          (source === "LessWrong" || source === "EA Forum") && items.length > 3;
+
+        const headerHtml = needsHeader
+          ? `<h4 style="margin: 20px 0 10px 0; font-size: 1.1em; color: #555; border-bottom: 1px solid #eee; padding-bottom: 5px;">
+          ${escapeHtml(source)} (${items.length} posts)
+        </h4>`
+          : "";
+
+        const itemsForSource = items
+          .map((item, index) => {
+            const isLastInGroup = index === items.length - 1;
+            return renderItem(item, index, isLastInGroup);
+          })
+          .join("");
+
+        return headerHtml + itemsForSource;
+      })
+      .join("");
+  } else {
+    // For daily digest, keep original approach
+    itemsHtml = newContent
+      .map((item, index) => {
+        const isLastItem = index === newContent.length - 1;
+        return renderItem(item, index, isLastItem);
+      })
+      .join("");
+  }
 
   return `
     <html>
       <body style="font-family: sans-serif; color: #333;">
         <div style="max-width: 650px; margin-left: 0; margin-right: auto;">
-          <h2>Your ${subscription.frequency} AI Safety Digest</h2>
-          <p>Here are the latest updates based on your preferences:</p>
+          <h2 style="font-size: 1.6em;">Your ${subscription.frequency} <a href="https://aisafetyfeed.com/" style="text-decoration: underline;">AI Safety Feed</a> Digest</h2>
+          ${statsHtml}
           ${itemsHtml}
           <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-          <p style="font-size: 0.8em; color: #888;">
+          <p style="font-size: 0.9em; color: #888;">
             To unsubscribe from these updates, <a href="${unsubscribeUrl}" style="color: #007bff; text-decoration: none;">click here</a>.
           </p>
         </div>
@@ -380,7 +592,7 @@ async function fetchContentForSubscription(subscription) {
   // --- End query condition building ---
 
   const contentQuery = `
-    SELECT id, title, source_url, sentence_summary, published_date, cluster_tag, topics, novelty_score, cleaned_title, cleaned_image, image_prompt
+    SELECT id, title, source_url, sentence_summary, published_date, cluster_tag, topics, novelty_score, cleaned_title, cleaned_image, image_prompt, source_type, full_content_markdown
     FROM content
     WHERE ${queryConditions.join(" AND ")}
     ORDER BY published_date DESC
@@ -517,7 +729,7 @@ app.get("/api/content", async (req, res) => {
         break;
       case 4:
         minScore = 71;
-        maxScore = 80;
+        maxScore = 90;
         break;
       case 5:
         minScore = 91;
@@ -530,11 +742,14 @@ app.get("/api/content", async (req, res) => {
         break;
     }
 
-    // Only add the condition if minScore > 0
-    if (minScore > 0 || bucket === 1) {
-      conditions.push(`novelty_score >= $${finalParams.length + 1}`);
-      finalParams.push(minScore);
-    }
+    // Add condition for exclusive bucket range
+    conditions.push(
+      `novelty_score >= $${finalParams.length + 1} AND novelty_score <= $${
+        finalParams.length + 2
+      }`
+    );
+    finalParams.push(minScore);
+    finalParams.push(maxScore);
   }
 
   let query = `SELECT
@@ -730,7 +945,7 @@ app.get("/api/similar/:id/ai", async (req, res) => {
       return res.status(status).json({ error });
     }
 
-    /* ---------- 2. Gemini re-rank ---------- */
+    /* ---------- 2. GPT re-rank ---------- */
     let finalIds = [];
     if (openai && GPT_MODEL && uniqueCands.length > 0) {
       const prompt = buildRerankPrompt(ref, uniqueCands);
@@ -1023,7 +1238,12 @@ async function processSubscriptionsAndSendBatches() {
   );
 
   const now = new Date(); // Get current time
-  const dayOfWeekUTC = now.getUTCDay(); // 0 = Sunday, ..., 6 = Saturday (UTC)
+  // Use Eastern Time for day-of-week check to match cron schedule timezone
+  const easternTimeString = now.toLocaleString("en-US", {
+    timeZone: "America/New_York",
+  });
+  const easternDate = new Date(easternTimeString);
+  const dayOfWeekET = easternDate.getDay(); // 0 = Sunday, ..., 6 = Saturday (Eastern Time)
   const nowUtcMillis = now.getTime(); // Current time in UTC milliseconds
   const messagesToSend = []; // Array to hold all message objects for the batch
   const subscriptionsToUpdateTimestamp = []; // IDs of subs where email is sent
@@ -1034,8 +1254,8 @@ async function processSubscriptionsAndSendBatches() {
     let shouldProcess = false;
     if (sub.frequency === "daily") {
       shouldProcess = true;
-    } else if (sub.frequency === "weekly" && dayOfWeekUTC === 1) {
-      // Weekly on Monday (UTC)
+    } else if (sub.frequency === "weekly" && dayOfWeekET === 1) {
+      // Weekly on Monday (Eastern Time) - now consistent with cron schedule
       shouldProcess = true;
     }
 
@@ -1069,14 +1289,48 @@ async function processSubscriptionsAndSendBatches() {
       }
 
       if (newContent.length > 0) {
+        // Create preheader text
+        const preheaderStats = [];
+        const sourceTypes = [
+          ...new Set(newContent.map((c) => c.source_type)),
+        ].filter(Boolean);
+        preheaderStats.push(`${newContent.length} new posts`);
+        if (sourceTypes.length > 0) {
+          preheaderStats.push(`from ${sourceTypes.slice(0, 3).join(", ")}`);
+        }
+        const preheaderText = preheaderStats.join(" ");
+
         const htmlBody = generateDigestHtml(sub, newContent);
+
+        // Add hidden preheader span at the very beginning of the HTML
+        const htmlWithPreheader = htmlBody
+          .replace(
+            "<html>",
+            `<html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          </head>`
+          )
+          .replace(
+            '<body style="font-family: sans-serif; color: #333;">',
+            `<body style="font-family: sans-serif; color: #333;">
+          <div style="display: none; max-height: 0; overflow: hidden; mso-hide: all;">
+            ${escapeHtml(preheaderText)}
+            &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
+          </div>
+          <div style="display: none; max-height: 0; overflow: hidden; mso-hide: all;">
+            &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
+          </div>`
+          );
+
         messagesToSend.push({
           From: "AI Safety Feed <digest@aisafetyfeed.com>",
           To: sub.email,
           Subject: `Your ${
             sub.frequency
-          } AI Safety Digest - ${now.toLocaleDateString()}`,
-          HtmlBody: htmlBody,
+          } AI Safety Feed Digest - ${now.toLocaleDateString()}`,
+          HtmlBody: htmlWithPreheader,
           MessageStream: "broadcast",
           Tag: `${sub.frequency}-digest`,
         });
