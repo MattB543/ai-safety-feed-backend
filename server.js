@@ -238,7 +238,10 @@ const swaggerOptions = {
     },
     servers: [
       {
-        url: process.env.BASE_URL || `http://localhost:${PORT}`,
+        url:
+          process.env.API_BASE_URL ||
+          process.env.BACKEND_URL ||
+          `http://localhost:${PORT}`,
         description: "API Server",
       },
     ],
@@ -884,24 +887,6 @@ app.get("/api/content/export", async (_req, res) => {
   }
 });
 
-// NEW endpoint to fetch a single post by ID
-// NOTE: This must come *after* /api/content/by-ids to avoid conflict
-app.get("/api/content/:id", async (req, res) => {
-  try {
-    const {
-      rows: [post],
-    } = await pool.query("SELECT * FROM content WHERE id=$1", [req.params.id]);
-    if (post) {
-      res.json(post);
-    } else {
-      res.sendStatus(404);
-    }
-  } catch (err) {
-    console.error(`Error fetching content with ID ${req.params.id}:`, err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
 // Helper function to find vector similar candidates
 async function findVectorSimilarCandidates(id, k) {
   console.log(`[findVectorSimilarCandidates/${id}] Fetching reference post...`);
@@ -1117,6 +1102,129 @@ app.get("/api/similar/:id/ai", async (req, res) => {
 });
 
 // --- NEW PUBLIC API ENDPOINTS FOR POSTS TABLE ---
+
+/**
+ * @swagger
+ * /api/v1/posts/sources:
+ *   get:
+ *     summary: Get all unique source types
+ *     tags: [Metadata]
+ *     responses:
+ *       200:
+ *         description: List of source types
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: string
+ *               example: ["EA Forum", "LessWrong", "Alignment Forum"]
+ */
+app.get("/api/v1/posts/sources", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT DISTINCT source_type FROM posts WHERE source_type IS NOT NULL ORDER BY source_type"
+    );
+    res.json(rows.map((r) => r.source_type));
+  } catch (err) {
+    console.error("Error fetching sources:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/tags:
+ *   get:
+ *     summary: Get all unique tags with counts
+ *     tags: [Metadata]
+ *     responses:
+ *       200:
+ *         description: List of tags with post counts
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: object
+ *                 properties:
+ *                   tag:
+ *                     type: string
+ *                   count:
+ *                     type: integer
+ */
+app.get("/api/v1/posts/tags", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT tag, COUNT(*)::int as count
+      FROM posts, unnest(feed_tags) as tag
+      WHERE tag IS NOT NULL
+      GROUP BY tag
+      ORDER BY count DESC, tag ASC
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error("Error fetching tags:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/stats:
+ *   get:
+ *     summary: Get statistics about the posts
+ *     tags: [Metadata]
+ *     responses:
+ *       200:
+ *         description: Statistics about posts
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 total_posts:
+ *                   type: integer
+ *                 sources:
+ *                   type: integer
+ *                 date_range:
+ *                   type: object
+ *                   properties:
+ *                     earliest:
+ *                       type: string
+ *                       format: date-time
+ *                     latest:
+ *                       type: string
+ *                       format: date-time
+ *                 avg_reading_time:
+ *                   type: number
+ */
+app.get("/api/v1/posts/stats", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        COUNT(*)::int as total_posts,
+        COUNT(DISTINCT source_type)::int as sources,
+        MIN(published_date) as earliest,
+        MAX(published_date) as latest,
+        AVG(reading_time_minutes)::float as avg_reading_time
+      FROM posts
+    `);
+
+    res.json({
+      total_posts: rows[0].total_posts,
+      sources: rows[0].sources,
+      date_range: {
+        earliest: rows[0].earliest,
+        latest: rows[0].latest,
+      },
+      avg_reading_time: rows[0].avg_reading_time,
+    });
+  } catch (err) {
+    console.error("Error fetching stats:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
 
 /**
  * @swagger
@@ -1339,123 +1447,40 @@ app.get("/api/v1/posts", async (req, res) => {
 
 /**
  * @swagger
- * /api/v1/posts/sources:
+ * /api/v1/posts/{id}:
  *   get:
- *     summary: Get all unique source types
- *     tags: [Metadata]
+ *     summary: Get a single post by ID
+ *     tags: [Posts]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: Post ID
  *     responses:
  *       200:
- *         description: List of source types
+ *         description: Success
  *         content:
  *           application/json:
  *             schema:
- *               type: array
- *               items:
- *                 type: string
- *               example: ["EA Forum", "LessWrong", "Alignment Forum"]
+ *               $ref: '#/components/schemas/Post'
+ *       404:
+ *         description: Post not found
  */
-app.get("/api/v1/posts/sources", async (req, res) => {
+app.get("/api/v1/posts/:id", async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      "SELECT DISTINCT source_type FROM posts WHERE source_type IS NOT NULL ORDER BY source_type"
-    );
-    res.json(rows.map((r) => r.source_type));
-  } catch (err) {
-    console.error("Error fetching sources:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+    const { rows } = await pool.query("SELECT * FROM posts WHERE id = $1", [
+      req.params.id,
+    ]);
 
-/**
- * @swagger
- * /api/v1/posts/tags:
- *   get:
- *     summary: Get all unique tags with counts
- *     tags: [Metadata]
- *     responses:
- *       200:
- *         description: List of tags with post counts
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 type: object
- *                 properties:
- *                   tag:
- *                     type: string
- *                   count:
- *                     type: integer
- */
-app.get("/api/v1/posts/tags", async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT tag, COUNT(*)::int as count
-      FROM posts, unnest(feed_tags) as tag
-      WHERE tag IS NOT NULL
-      GROUP BY tag
-      ORDER BY count DESC, tag ASC
-    `);
-    res.json(rows);
-  } catch (err) {
-    console.error("Error fetching tags:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Post not found" });
+    }
 
-/**
- * @swagger
- * /api/v1/posts/stats:
- *   get:
- *     summary: Get statistics about the posts
- *     tags: [Metadata]
- *     responses:
- *       200:
- *         description: Statistics about posts
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 total_posts:
- *                   type: integer
- *                 sources:
- *                   type: integer
- *                 date_range:
- *                   type: object
- *                   properties:
- *                     earliest:
- *                       type: string
- *                       format: date-time
- *                     latest:
- *                       type: string
- *                       format: date-time
- *                 avg_reading_time:
- *                   type: number
- */
-app.get("/api/v1/posts/stats", async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT 
-        COUNT(*)::int as total_posts,
-        COUNT(DISTINCT source_type)::int as sources,
-        MIN(published_date) as earliest,
-        MAX(published_date) as latest,
-        AVG(reading_time_minutes)::float as avg_reading_time
-      FROM posts
-    `);
-
-    res.json({
-      total_posts: rows[0].total_posts,
-      sources: rows[0].sources,
-      date_range: {
-        earliest: rows[0].earliest,
-        latest: rows[0].latest,
-      },
-      avg_reading_time: rows[0].avg_reading_time,
-    });
+    res.json(rows[0]);
   } catch (err) {
-    console.error("Error fetching stats:", err);
+    console.error("Error fetching post:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1497,46 +1522,6 @@ app.get("/api/v1/posts/by-uuid/:uuid", async (req, res) => {
     res.json(rows[0]);
   } catch (err) {
     console.error("Error fetching post by UUID:", err);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
-
-/**
- * @swagger
- * /api/v1/posts/{id}:
- *   get:
- *     summary: Get a single post by ID
- *     tags: [Posts]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
- *         description: Post ID
- *     responses:
- *       200:
- *         description: Success
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Post'
- *       404:
- *         description: Post not found
- */
-app.get("/api/v1/posts/:id", async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT * FROM posts WHERE id = $1", [
-      req.params.id,
-    ]);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Post not found" });
-    }
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("Error fetching post:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1667,6 +1652,24 @@ app.get("/api/unsubscribe/:token", async (req, res) => {
         <p>An error occurred while processing your unsubscribe request. Please try again later.</p>
       </body></html>
     `);
+  }
+});
+
+// NEW endpoint to fetch a single post by ID
+// NOTE: This must come *after* /api/content/by-ids to avoid conflict
+app.get("/api/content/:id", async (req, res) => {
+  try {
+    const {
+      rows: [post],
+    } = await pool.query("SELECT * FROM content WHERE id=$1", [req.params.id]);
+    if (post) {
+      res.json(post);
+    } else {
+      res.sendStatus(404);
+    }
+  } catch (err) {
+    console.error(`Error fetching content with ID ${req.params.id}:`, err);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
