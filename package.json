@@ -24,6 +24,8 @@
     "openai": "^4.102.0",
     "pg": "^8.14.1",
     "postmark": "^4.0.5",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
     "uuid": "^11.1.0"
   },
   "devDependencies": {

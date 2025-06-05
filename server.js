@@ -10,6 +10,9 @@ const postmark = require("postmark");
 const { v4: uuidv4 } = require("uuid");
 const cron = require("node-cron"); // Import node-cron
 
+const swaggerJsdoc = require("swagger-jsdoc");
+const swaggerUi = require("swagger-ui-express");
+
 const OpenAI = require("openai");
 const openai = new OpenAI({
   apiKey: process.env.OPEN_AI_FREE_CREDITS_KEY,
@@ -221,10 +224,43 @@ app.use(express.json());
 // Enable CORS
 app.use(cors());
 
+const swaggerOptions = {
+  definition: {
+    openapi: "3.0.0",
+    info: {
+      title: "AI Safety Feed Public API",
+      version: "1.0.0",
+      description: "Public API for accessing AI safety posts and research",
+      contact: {
+        name: "AI Safety Feed",
+        url: "https://aisafetyfeed.com",
+      },
+    },
+    servers: [
+      {
+        url: process.env.BASE_URL || `http://localhost:${PORT}`,
+        description: "API Server",
+      },
+    ],
+  },
+  apis: ["./server.js"], // Path to file containing JSDoc comments
+};
+
+const swaggerSpec = swaggerJsdoc(swaggerOptions);
+
 // Define the /health endpoint
 app.get("/health", (req, res) => {
   res.sendStatus(200);
 });
+
+app.use(
+  "/api-docs",
+  swaggerUi.serve,
+  swaggerUi.setup(swaggerSpec, {
+    customCss: ".swagger-ui .topbar { display: none }",
+    customSiteTitle: "AI Safety Feed API Docs",
+  })
+);
 
 // Helper function to build WHERE clause and parameters for list endpoints
 function buildWhere({ search, sources }) {
@@ -1080,6 +1116,431 @@ app.get("/api/similar/:id/ai", async (req, res) => {
   }
 });
 
+// --- NEW PUBLIC API ENDPOINTS FOR POSTS TABLE ---
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     Post:
+ *       type: object
+ *       properties:
+ *         id:
+ *           type: integer
+ *           description: Unique identifier
+ *         uuid:
+ *           type: string
+ *           format: uuid
+ *         title:
+ *           type: string
+ *         source_url:
+ *           type: string
+ *           format: uri
+ *         source_type:
+ *           type: string
+ *           example: "EA Forum"
+ *         published_date:
+ *           type: string
+ *           format: date-time
+ *         authors_display:
+ *           type: array
+ *           items:
+ *             type: string
+ *         short_summary:
+ *           type: string
+ *         long_summary:
+ *           type: string
+ *         key_implication:
+ *           type: string
+ *         novelty_score:
+ *           type: number
+ *           minimum: 0
+ *           maximum: 100
+ *         feed_tags:
+ *           type: array
+ *           items:
+ *             type: string
+ *         reading_time_minutes:
+ *           type: integer
+ *         word_count:
+ *           type: integer
+ */
+
+/**
+ * @swagger
+ * /api/v1/posts:
+ *   get:
+ *     summary: Get posts with filtering and pagination
+ *     description: Retrieve AI safety posts from various sources with optional filtering
+ *     tags: [Posts]
+ *     parameters:
+ *       - in: query
+ *         name: search
+ *         schema:
+ *           type: string
+ *         description: Search in title, summary, and authors
+ *       - in: query
+ *         name: source_type
+ *         schema:
+ *           type: string
+ *         description: Filter by source (e.g., "EA Forum", "LessWrong")
+ *       - in: query
+ *         name: tags
+ *         schema:
+ *           type: string
+ *         description: Comma-separated list of feed tags
+ *       - in: query
+ *         name: novelty_min
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           maximum: 100
+ *         description: Minimum novelty score
+ *       - in: query
+ *         name: published_after
+ *         schema:
+ *           type: string
+ *           format: date
+ *         description: Filter posts published after this date
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 20
+ *       - in: query
+ *         name: offset
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *           default: 0
+ *     responses:
+ *       200:
+ *         description: Success
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 data:
+ *                   type: array
+ *                   items:
+ *                     $ref: '#/components/schemas/Post'
+ *                 pagination:
+ *                   type: object
+ *                   properties:
+ *                     total:
+ *                       type: integer
+ *                     limit:
+ *                       type: integer
+ *                     offset:
+ *                       type: integer
+ *                     hasMore:
+ *                       type: boolean
+ */
+app.get("/api/v1/posts", async (req, res) => {
+  try {
+    const {
+      search,
+      source_type,
+      tags,
+      novelty_min,
+      published_after,
+      limit = 20,
+      offset = 0,
+    } = req.query;
+
+    // Build query
+    const conditions = [];
+    const params = [];
+    let paramIndex = 1;
+
+    // Search filter
+    if (search) {
+      conditions.push(`(
+        title ILIKE $${paramIndex} OR 
+        short_summary ILIKE $${paramIndex} OR 
+        long_summary ILIKE $${paramIndex} OR
+        array_to_string(authors_display, ' ') ILIKE $${paramIndex}
+      )`);
+      params.push(`%${search}%`);
+      paramIndex++;
+    }
+
+    // Source type filter
+    if (source_type) {
+      conditions.push(`source_type = $${paramIndex}`);
+      params.push(source_type);
+      paramIndex++;
+    }
+
+    // Tags filter
+    if (tags) {
+      const tagList = tags.split(",").map((t) => t.trim());
+      conditions.push(`feed_tags && $${paramIndex}::text[]`);
+      params.push(tagList);
+      paramIndex++;
+    }
+
+    // Novelty score filter
+    if (novelty_min) {
+      conditions.push(`novelty_score >= $${paramIndex}`);
+      params.push(parseInt(novelty_min));
+      paramIndex++;
+    }
+
+    // Date filter
+    if (published_after) {
+      conditions.push(`published_date >= $${paramIndex}`);
+      params.push(published_after);
+      paramIndex++;
+    }
+
+    // Build final query
+    let query = "SELECT * FROM posts";
+    if (conditions.length > 0) {
+      query += " WHERE " + conditions.join(" AND ");
+    }
+    query += ` ORDER BY published_date DESC LIMIT $${paramIndex} OFFSET $${
+      paramIndex + 1
+    }`;
+    params.push(parseInt(limit), parseInt(offset));
+
+    // Get total count
+    let countQuery = "SELECT COUNT(*) FROM posts";
+    if (conditions.length > 0) {
+      countQuery += " WHERE " + conditions.join(" AND ");
+    }
+    const countParams = params.slice(0, -2); // Remove limit and offset
+
+    // Execute queries
+    const [dataResult, countResult] = await Promise.all([
+      pool.query(query, params),
+      pool.query(countQuery, countParams),
+    ]);
+
+    const total = parseInt(countResult.rows[0].count);
+
+    res.json({
+      data: dataResult.rows,
+      pagination: {
+        total,
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        hasMore: offset + limit < total,
+      },
+    });
+  } catch (err) {
+    console.error("Error fetching posts:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/sources:
+ *   get:
+ *     summary: Get all unique source types
+ *     tags: [Metadata]
+ *     responses:
+ *       200:
+ *         description: List of source types
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: string
+ *               example: ["EA Forum", "LessWrong", "Alignment Forum"]
+ */
+app.get("/api/v1/posts/sources", async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      "SELECT DISTINCT source_type FROM posts WHERE source_type IS NOT NULL ORDER BY source_type"
+    );
+    res.json(rows.map((r) => r.source_type));
+  } catch (err) {
+    console.error("Error fetching sources:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/tags:
+ *   get:
+ *     summary: Get all unique tags with counts
+ *     tags: [Metadata]
+ *     responses:
+ *       200:
+ *         description: List of tags with post counts
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: object
+ *                 properties:
+ *                   tag:
+ *                     type: string
+ *                   count:
+ *                     type: integer
+ */
+app.get("/api/v1/posts/tags", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT tag, COUNT(*)::int as count
+      FROM posts, unnest(feed_tags) as tag
+      WHERE tag IS NOT NULL
+      GROUP BY tag
+      ORDER BY count DESC, tag ASC
+    `);
+    res.json(rows);
+  } catch (err) {
+    console.error("Error fetching tags:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/stats:
+ *   get:
+ *     summary: Get statistics about the posts
+ *     tags: [Metadata]
+ *     responses:
+ *       200:
+ *         description: Statistics about posts
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 total_posts:
+ *                   type: integer
+ *                 sources:
+ *                   type: integer
+ *                 date_range:
+ *                   type: object
+ *                   properties:
+ *                     earliest:
+ *                       type: string
+ *                       format: date-time
+ *                     latest:
+ *                       type: string
+ *                       format: date-time
+ *                 avg_reading_time:
+ *                   type: number
+ */
+app.get("/api/v1/posts/stats", async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT 
+        COUNT(*)::int as total_posts,
+        COUNT(DISTINCT source_type)::int as sources,
+        MIN(published_date) as earliest,
+        MAX(published_date) as latest,
+        AVG(reading_time_minutes)::float as avg_reading_time
+      FROM posts
+    `);
+
+    res.json({
+      total_posts: rows[0].total_posts,
+      sources: rows[0].sources,
+      date_range: {
+        earliest: rows[0].earliest,
+        latest: rows[0].latest,
+      },
+      avg_reading_time: rows[0].avg_reading_time,
+    });
+  } catch (err) {
+    console.error("Error fetching stats:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/by-uuid/{uuid}:
+ *   get:
+ *     summary: Get a single post by UUID
+ *     tags: [Posts]
+ *     parameters:
+ *       - in: path
+ *         name: uuid
+ *         required: true
+ *         schema:
+ *           type: string
+ *           format: uuid
+ *         description: Post UUID
+ *     responses:
+ *       200:
+ *         description: Success
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Post'
+ *       404:
+ *         description: Post not found
+ */
+app.get("/api/v1/posts/by-uuid/:uuid", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM posts WHERE uuid = $1", [
+      req.params.uuid,
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Post not found" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Error fetching post by UUID:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/{id}:
+ *   get:
+ *     summary: Get a single post by ID
+ *     tags: [Posts]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *         description: Post ID
+ *     responses:
+ *       200:
+ *         description: Success
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Post'
+ *       404:
+ *         description: Post not found
+ */
+app.get("/api/v1/posts/:id", async (req, res) => {
+  try {
+    const { rows } = await pool.query("SELECT * FROM posts WHERE id = $1", [
+      req.params.id,
+    ]);
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Post not found" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Error fetching post:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // --- Email Subscription Endpoints ---
 
 // POST /api/subscribe
@@ -1320,7 +1781,7 @@ async function processSubscriptionsAndSendBatches() {
             &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
           </div>
           <div style="display: none; max-height: 0; overflow: hidden; mso-hide: all;">
-            &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
+            &nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;&nbsp;&zwnj;
           </div>`
           );
 
