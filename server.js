@@ -1718,8 +1718,8 @@ async function processSubscriptionsAndSendBatches() {
     let shouldProcess = false;
     if (sub.frequency === "daily") {
       shouldProcess = true;
-    } else if (sub.frequency === "weekly" && dayOfWeekET === 1) {
-      // Weekly on Monday (Eastern Time) - now consistent with cron schedule
+    } else if (sub.frequency === "weekly" && dayOfWeekET === 2) {
+      // Weekly on Tuesday (Eastern Time) - now consistent with cron schedule
       shouldProcess = true;
     }
 
