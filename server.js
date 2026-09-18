@@ -4,7 +4,9 @@ const cors = require("cors");
 require("dotenv").config();
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const { Parser } = require("json2csv");
+const QueryStream = require("pg-query-stream");
+const { Transform } = require("stream");
+const { pipeline } = require("stream/promises");
 const fs = require("fs");
 const postmark = require("postmark");
 const { v4: uuidv4 } = require("uuid");
@@ -161,6 +163,10 @@ function generateSimilarUrl(article, baseUrl) {
 
 const app = express();
 
+// Render terminates TLS and proxies to us. Trust that one hop so req.ip, and
+// therefore the per-IP rate limit, refers to the client rather than the proxy.
+app.set("trust proxy", 1);
+
 app.use(helmet());
 
 // Apply rate limiting to all requests
@@ -194,7 +200,28 @@ const pool = new Pool({
   ssl: {
     rejectUnauthorized: false,
   },
+  // Fail fast instead of queueing forever if every connection is busy.
+  connectionTimeoutMillis: 10000,
 });
+
+// Columns of public.content minus the two 1536-dim vectors. Most endpoints
+// never need the vectors, and SELECT * shipped ~30-60 KB of them per row.
+let CONTENT_COLS = "*";
+async function loadContentColumns() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'content'
+          AND column_name NOT IN ('embedding_short', 'embedding_full')
+        ORDER BY ordinal_position`
+    );
+    if (rows.length) {
+      CONTENT_COLS = rows.map((r) => `"${r.column_name}"`).join(", ");
+    }
+  } catch (err) {
+    console.error("Could not load content columns; falling back to SELECT *:", err.message);
+  }
+}
 
 // Add error handler for the pool
 pool.on("error", (err) => {
@@ -752,43 +779,34 @@ app.get("/api/content", async (req, res) => {
     }
   }
 
-  // Add novelty_bucket filter if provided
+  // Add novelty_bucket filter if provided.
+  // The bucket is a MINIMUM, not an exclusive band: the frontend presents this
+  // as "N and above" (e.g. "Novelty 4+"), so bucket 4 must still include 5/5
+  // posts. Bucket N maps to a floor on novelty_score and has no upper bound.
   if (novelty_bucket) {
     const bucket = parseInt(novelty_bucket);
     let minScore = 0;
-    let maxScore = 100;
     switch (bucket) {
       case 2:
         minScore = 21;
-        maxScore = 40;
         break;
       case 3:
         minScore = 41;
-        maxScore = 70;
         break;
       case 4:
         minScore = 71;
-        maxScore = 90;
         break;
       case 5:
         minScore = 91;
-        maxScore = 100;
         break;
-      // case 1 and default: minScore = 0, maxScore = 20
+      // case 1 and default: minScore = 0 (no effective floor)
       case 1:
         minScore = 0;
-        maxScore = 20;
         break;
     }
 
-    // Add condition for exclusive bucket range
-    conditions.push(
-      `novelty_score >= $${finalParams.length + 1} AND novelty_score <= $${
-        finalParams.length + 2
-      }`
-    );
+    conditions.push(`novelty_score >= $${finalParams.length + 1}`);
     finalParams.push(minScore);
-    finalParams.push(maxScore);
   }
 
   let query = `SELECT
@@ -853,7 +871,7 @@ app.get("/api/content/by-ids", async (req, res) => {
 
   try {
     // Use ANY operator for efficient querying with an array of IDs
-    const query = "SELECT * FROM content WHERE id = ANY($1::int[])";
+    const query = `SELECT ${CONTENT_COLS} FROM content WHERE id = ANY($1::int[])`;
     const { rows } = await pool.query(query, [idList]);
 
     // Return the found posts. It might be an empty array if none of the IDs matched.
@@ -865,25 +883,118 @@ app.get("/api/content/by-ids", async (req, res) => {
   }
 });
 
+// Each export holds a pooled DB connection for the whole download, so cap how
+// many run at once; otherwise a handful of slow clients could starve the site.
+const MAX_CONCURRENT_EXPORTS = 2;
+let activeExports = 0;
+
+function csvCell(v) {
+  if (v === null || v === undefined) return "";
+  let s;
+  if (v instanceof Date) s = v.toISOString();
+  else if (typeof v === "object") s = JSON.stringify(v);
+  else s = String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
 /**
- * GET /api/content/export
- * Streams every row of public.content as a downloadable CSV
+ * @swagger
+ * /api/content/export:
+ *   get:
+ *     summary: Download the dataset as CSV
+ *     description: |
+ *       Streams every post (or the filtered subset) as a UTF-8 CSV, one row per post, ordered by id. The columns are the fields of the Post schema; arrays such as authors and topics are JSON-encoded in their cell.
+ *       The article body is left out by default; pass `include_content=true` to add a `full_content_markdown` column (the download is then roughly ten times larger). At most two exports run at once; a third gets a 429 with a Retry-After header.
+ *     tags: [Feeds]
+ *     parameters:
+ *       - $ref: '#/components/parameters/search'
+ *       - $ref: '#/components/parameters/source_type'
+ *       - $ref: '#/components/parameters/sources'
+ *       - $ref: '#/components/parameters/tags'
+ *       - $ref: '#/components/parameters/topics'
+ *       - $ref: '#/components/parameters/novelty_min'
+ *       - $ref: '#/components/parameters/novelty_max'
+ *       - $ref: '#/components/parameters/published_after'
+ *       - $ref: '#/components/parameters/published_before'
+ *       - in: query
+ *         name: include_content
+ *         schema:
+ *           type: boolean
+ *           default: false
+ *     responses:
+ *       200:
+ *         description: CSV file
+ *         content:
+ *           text/csv:
+ *             schema:
+ *               type: string
+ *       400:
+ *         description: Invalid parameter value
+ *       429:
+ *         description: Too many exports in progress; retry after the Retry-After delay
  */
-app.get("/api/content/export", async (_req, res) => {
+app.get("/api/content/export", async (req, res) => {
+  let where;
+  let includeContent;
   try {
-    const { rows } = await pool.query("SELECT * FROM content ORDER BY id"); // grab everything
-    const csv = new Parser().parse(rows); // → string
-    res.setHeader("Content-Type", "text/csv");
+    where = buildV1Where(req.query);
+    includeContent = boolParam(req.query, "include_content");
+  } catch (err) {
+    return sendError(res, err, "GET /api/content/export");
+  }
+
+  if (activeExports >= MAX_CONCURRENT_EXPORTS) {
+    res.set("Retry-After", "30");
+    return res
+      .status(429)
+      .json({ error: "Too many exports in progress; try again in about 30 seconds" });
+  }
+  activeExports++;
+
+  const fields = includeContent ? [...V1_POST_FIELDS, "full_content_markdown"] : V1_POST_FIELDS;
+  const sql = `SELECT ${selectCols(fields)} FROM content ${where.whereSQL} ORDER BY id`;
+
+  let client;
+  let failure;
+  try {
+    client = await pool.connect();
+    // Cursor-backed stream: rows are fetched in batches as the response
+    // drains, so memory stays flat however large the table gets.
+    const rows = client.query(
+      new QueryStream(sql, where.params, { batchSize: includeContent ? 25 : 200 })
+    );
+    const toCsv = new Transform({
+      objectMode: true,
+      transform(row, _enc, cb) {
+        cb(null, fields.map((f) => csvCell(row[f])).join(",") + "\n");
+      },
+    });
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="content-${new Date()
-        .toISOString()
-        .slice(0, 10)}.csv"`
+      `attachment; filename="ai-safety-feed-${new Date().toISOString().slice(0, 10)}.csv"`
     );
-    return res.status(200).send(csv);
+    res.write(fields.join(",") + "\n");
+    // pipeline() propagates failure in both directions: a DB error cuts the
+    // response (the client sees a truncated download, not a "complete" partial
+    // file) and a client that disconnects destroys the cursor.
+    await pipeline(rows, toCsv, res);
   } catch (err) {
-    console.error("CSV export error:", err);
-    return res.status(500).json({ error: "Failed to export CSV" });
+    failure = err;
+    if (err.code === "ERR_STREAM_PREMATURE_CLOSE") {
+      // Client went away mid-download; nothing to report.
+    } else if (!res.headersSent) {
+      sendError(res, err, "GET /api/content/export");
+    } else {
+      console.error("[GET /api/content/export] failed mid-stream:", err);
+      res.destroy();
+    }
+  } finally {
+    activeExports--;
+    // Passing the error makes the pool discard a client whose cursor may still
+    // be mid-flight instead of handing it to the next request.
+    if (client) client.release(failure);
   }
 });
 
@@ -912,13 +1023,13 @@ async function findVectorSimilarCandidates(id, k) {
   );
   const { rows: cands } = await pool.query(
     `
-      (SELECT *, embedding_short <=> $1 AS dist
+      (SELECT ${CONTENT_COLS}, embedding_short <=> $1 AS dist
         FROM content
         WHERE id <> $3 AND embedding_short IS NOT NULL
     ORDER BY embedding_short <=> $1
         LIMIT $2)
       UNION ALL
-      (SELECT *, embedding_full  <=> $4 AS dist
+      (SELECT ${CONTENT_COLS}, embedding_full  <=> $4 AS dist
         FROM content
         WHERE id <> $3 AND embedding_full IS NOT NULL
     ORDER BY embedding_full  <=> $4
@@ -1074,7 +1185,7 @@ app.get("/api/similar/:id/ai", async (req, res) => {
     );
     const numericFinalIds = finalIds.map(String).map(Number); // Ensure IDs are numbers for query
     const { rows: finals } = await pool.query(
-      "SELECT * FROM content WHERE id = ANY($1::int[])",
+      `SELECT ${CONTENT_COLS} FROM content WHERE id = ANY($1::int[])`,
       [numericFinalIds] // Use the numeric array
     );
     console.log(
@@ -1101,34 +1212,415 @@ app.get("/api/similar/:id/ai", async (req, res) => {
   }
 });
 
-// --- NEW PUBLIC API ENDPOINTS FOR POSTS TABLE ---
+// ---------------------------------------------------------------------------
+// Public v1 API — reads public.content, the same table the website uses.
+// Documented in Swagger at /api-docs. The helpers here are shared with the CSV
+// export and the RSS feed so all three accept the same filters.
+// ---------------------------------------------------------------------------
+
+// Fields exposed by the public API and the CSV export, in output order. The
+// article body (full_content_markdown) is added only where documented. The
+// embedding vectors and internal columns (title_norm, image_prompt,
+// full_content, content_snippet) are never exposed.
+const V1_POST_FIELDS = [
+  "id",
+  "uuid",
+  "title",
+  "cleaned_title",
+  "source_url",
+  "source_type",
+  "authors",
+  "published_date",
+  "sentence_summary",
+  "paragraph_summary",
+  "key_implication",
+  "why_valuable",
+  "unique_aspects",
+  "author_credentials",
+  "novelty_score",
+  "novelty_note",
+  "cluster_tag",
+  "topics",
+  "image_url",
+  "cleaned_image",
+  "audio_url",
+  "score",
+  "comment_count",
+  "created_at",
+  "updated_at",
+];
+// novelty_score is NUMERIC in Postgres, which node-pg returns as a string.
+const selectCols = (fields) =>
+  fields
+    .map((f) => (f === "novelty_score" ? "novelty_score::float AS novelty_score" : `"${f}"`))
+    .join(", ");
+const V1_POST_COLS = selectCols(V1_POST_FIELDS);
+const V1_POST_COLS_WITH_CONTENT = selectCols([...V1_POST_FIELDS, "full_content_markdown"]);
+
+const V1_SORTS = {
+  newest: "published_date DESC NULLS LAST, id DESC",
+  oldest: "published_date ASC NULLS LAST, id ASC",
+  novelty: "novelty_score DESC NULLS LAST, published_date DESC, id DESC",
+  random: "RANDOM()",
+};
+
+const PG_INT4_MAX = 2147483647;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Thrown by the query-parsing helpers below; handlers turn it into a 400.
+class ValidationError extends Error {}
+
+function sendError(res, err, label) {
+  if (err instanceof ValidationError) {
+    return res.status(400).json({ error: err.message });
+  }
+  console.error(`[${label}]`, err);
+  return res.status(500).json({ error: "Internal server error" });
+}
+
+// Express gives a string for a query key, or an array when the key repeats.
+function scalarParam(q, key) {
+  const v = q[key];
+  if (v === undefined || v === "") return undefined;
+  if (typeof v !== "string") throw new ValidationError(`${key} must be given once`);
+  return v;
+}
+
+// Multi-valued param. Repeating the key always works (?a=x&a=y). Splitting on
+// commas is opt-in because some values contain commas, e.g. the source
+// "80,000 Hours Podcast".
+function listParam(q, key, { split }) {
+  const raw = q[key];
+  if (raw === undefined) return [];
+  return (Array.isArray(raw) ? raw : [raw])
+    .flatMap((v) => (split ? String(v).split(",") : [String(v)]))
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function boolParam(q, key) {
+  const v = scalarParam(q, key);
+  return v !== undefined && ["1", "true", "yes"].includes(v.toLowerCase());
+}
+
+function intParam(q, key, def, min, max) {
+  const v = scalarParam(q, key);
+  if (v === undefined) return def;
+  if (!/^\d+$/.test(v)) throw new ValidationError(`${key} must be a non-negative integer`);
+  return Math.min(max, Math.max(min, Number(v)));
+}
+
+function numberParam(q, key) {
+  const v = scalarParam(q, key);
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw new ValidationError(`${key} must be a number`);
+  return n;
+}
+
+function dateParam(q, key) {
+  const v = scalarParam(q, key);
+  if (v === undefined) return undefined;
+  const d = new Date(v);
+  // new Date("2026-02-30") silently rolls over to March 2; reject that.
+  const plainDate = /^\d{4}-\d{2}-\d{2}$/.test(v);
+  if (Number.isNaN(d.getTime()) || (plainDate && d.toISOString().slice(0, 10) !== v)) {
+    throw new ValidationError(`${key} must be a valid date (e.g. 2026-01-31 or an ISO timestamp)`);
+  }
+  return d.toISOString();
+}
+
+function sortParam(q) {
+  const v = scalarParam(q, "sort") ?? "newest";
+  if (!Object.hasOwn(V1_SORTS, v)) {
+    throw new ValidationError(`Invalid sort '${v}'. Use one of: ${Object.keys(V1_SORTS).join(", ")}`);
+  }
+  return V1_SORTS[v];
+}
+
+/**
+ * WHERE clause shared by /api/v1/posts, /api/content/export and /rss.xml.
+ * Throws ValidationError on bad input.
+ */
+function buildV1Where(q) {
+  const clauses = [];
+  const params = [];
+  const add = (val, sql) => {
+    params.push(val);
+    clauses.push(sql(params.length));
+  };
+
+  const search = scalarParam(q, "search");
+  if (search) {
+    add(
+      `%${search}%`,
+      (i) => `(
+        title ILIKE $${i} OR cleaned_title ILIKE $${i} OR
+        sentence_summary ILIKE $${i} OR paragraph_summary ILIKE $${i} OR
+        key_implication ILIKE $${i} OR cluster_tag ILIKE $${i} OR
+        array_to_string(authors, ' ') ILIKE $${i} OR
+        array_to_string(topics, ' ') ILIKE $${i}
+      )`
+    );
+  }
+
+  // source_type: exact names, repeat the key for several. sources: the
+  // website's comma-separated form, kept as an alias.
+  const sources = [
+    ...listParam(q, "source_type", { split: false }),
+    ...listParam(q, "sources", { split: true }),
+  ];
+  if (sources.length) add(sources, (i) => `source_type = ANY($${i}::text[])`);
+
+  const tags = listParam(q, "tags", { split: true }).map((t) => t.toLowerCase());
+  if (tags.length) add(tags, (i) => `LOWER(cluster_tag) = ANY($${i}::text[])`);
+
+  const topics = listParam(q, "topics", { split: true }).map((t) => t.toLowerCase());
+  if (topics.length) {
+    add(
+      topics,
+      (i) => `EXISTS (SELECT 1 FROM unnest(topics) AS t WHERE LOWER(t) = ANY($${i}::text[]))`
+    );
+  }
+
+  const noveltyMin = numberParam(q, "novelty_min");
+  if (noveltyMin !== undefined) add(noveltyMin, (i) => `novelty_score >= $${i}`);
+  const noveltyMax = numberParam(q, "novelty_max");
+  if (noveltyMax !== undefined) add(noveltyMax, (i) => `novelty_score <= $${i}`);
+
+  const after = dateParam(q, "published_after");
+  if (after) add(after, (i) => `published_date >= $${i}`);
+  const before = dateParam(q, "published_before");
+  if (before) add(before, (i) => `published_date < $${i}`);
+
+  return {
+    whereSQL: clauses.length ? "WHERE " + clauses.join(" AND ") : "",
+    params,
+  };
+}
+
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     Post:
+ *       type: object
+ *       properties:
+ *         id:
+ *           type: integer
+ *           description: Stable numeric identifier
+ *         uuid:
+ *           type: string
+ *           format: uuid
+ *         title:
+ *           type: string
+ *           description: Title as published at the source
+ *         cleaned_title:
+ *           type: string
+ *           nullable: true
+ *           description: Tidied title, when one was generated. The website shows this when present and title otherwise.
+ *         source_url:
+ *           type: string
+ *           format: uri
+ *         source_type:
+ *           type: string
+ *           example: "Less Wrong"
+ *         authors:
+ *           type: array
+ *           nullable: true
+ *           items:
+ *             type: string
+ *         published_date:
+ *           type: string
+ *           format: date-time
+ *           nullable: true
+ *         sentence_summary:
+ *           type: string
+ *           nullable: true
+ *           description: One-sentence AI-generated summary
+ *         paragraph_summary:
+ *           type: string
+ *           nullable: true
+ *           description: Paragraph-length AI-generated summary (light markdown)
+ *         key_implication:
+ *           type: string
+ *           nullable: true
+ *         why_valuable:
+ *           type: string
+ *           nullable: true
+ *         unique_aspects:
+ *           type: string
+ *           nullable: true
+ *         author_credentials:
+ *           type: string
+ *           nullable: true
+ *         novelty_score:
+ *           type: number
+ *           nullable: true
+ *           minimum: 0
+ *           maximum: 100
+ *         novelty_note:
+ *           type: string
+ *           nullable: true
+ *         cluster_tag:
+ *           type: string
+ *           nullable: true
+ *           description: Single high-level category (see /api/v1/posts/tags)
+ *           example: "AI Governance & Policy"
+ *         topics:
+ *           type: array
+ *           nullable: true
+ *           items:
+ *             type: string
+ *           description: Finer-grained topics (see /api/v1/posts/topics)
+ *         image_url:
+ *           type: string
+ *           format: uri
+ *           nullable: true
+ *         cleaned_image:
+ *           type: string
+ *           format: uri
+ *           nullable: true
+ *         audio_url:
+ *           type: string
+ *           format: uri
+ *           nullable: true
+ *           description: Episode audio for podcast sources
+ *         score:
+ *           type: integer
+ *           nullable: true
+ *           description: Source-site score (e.g. forum karma), where available
+ *         comment_count:
+ *           type: integer
+ *           nullable: true
+ *         created_at:
+ *           type: string
+ *           format: date-time
+ *           description: When the post was added to the feed
+ *         updated_at:
+ *           type: string
+ *           format: date-time
+ *           nullable: true
+ *         full_content_markdown:
+ *           type: string
+ *           nullable: true
+ *           description: Article body as markdown. Only present on single-post endpoints or when include_content=true.
+ *     Pagination:
+ *       type: object
+ *       properties:
+ *         total:
+ *           type: integer
+ *         limit:
+ *           type: integer
+ *         offset:
+ *           type: integer
+ *         hasMore:
+ *           type: boolean
+ *   parameters:
+ *     search:
+ *       in: query
+ *       name: search
+ *       schema:
+ *         type: string
+ *       description: Case-insensitive substring match on title, summaries, key implication, authors, topics and tag
+ *     source_type:
+ *       in: query
+ *       name: source_type
+ *       schema:
+ *         type: array
+ *         items:
+ *           type: string
+ *       style: form
+ *       explode: true
+ *       description: Exact source name (see /api/v1/posts/sources). Repeat the parameter for several sources, e.g. `?source_type=EA Forum&source_type=Less Wrong`.
+ *     sources:
+ *       in: query
+ *       name: sources
+ *       schema:
+ *         type: string
+ *       description: Comma-separated alias for source_type. Cannot express names that contain a comma, such as "80,000 Hours Podcast"; use source_type for those.
+ *     tags:
+ *       in: query
+ *       name: tags
+ *       schema:
+ *         type: string
+ *       description: Cluster tags, case-insensitive; comma-separated or repeat the parameter (see /api/v1/posts/tags)
+ *       example: "ai governance & policy"
+ *     topics:
+ *       in: query
+ *       name: topics
+ *       schema:
+ *         type: string
+ *       description: Topics, case-insensitive; comma-separated or repeat the parameter. Matches posts with any of them (see /api/v1/posts/topics)
+ *     novelty_min:
+ *       in: query
+ *       name: novelty_min
+ *       schema:
+ *         type: number
+ *         minimum: 0
+ *         maximum: 100
+ *       description: Minimum novelty score
+ *     novelty_max:
+ *       in: query
+ *       name: novelty_max
+ *       schema:
+ *         type: number
+ *         minimum: 0
+ *         maximum: 100
+ *       description: Maximum novelty score
+ *     published_after:
+ *       in: query
+ *       name: published_after
+ *       schema:
+ *         type: string
+ *         format: date
+ *       description: Only posts published on or after this date or ISO timestamp
+ *     published_before:
+ *       in: query
+ *       name: published_before
+ *       schema:
+ *         type: string
+ *         format: date
+ *       description: Only posts published before this date or ISO timestamp
+ */
 
 /**
  * @swagger
  * /api/v1/posts/sources:
  *   get:
- *     summary: Get all unique source types
+ *     summary: List sources with post counts
  *     tags: [Metadata]
  *     responses:
  *       200:
- *         description: List of source types
+ *         description: One entry per source
  *         content:
  *           application/json:
  *             schema:
  *               type: array
  *               items:
- *                 type: string
- *               example: ["EA Forum", "LessWrong", "Alignment Forum"]
+ *                 type: object
+ *                 properties:
+ *                   source_type:
+ *                     type: string
+ *                   count:
+ *                     type: integer
+ *                   latest_published:
+ *                     type: string
+ *                     format: date-time
  */
-app.get("/api/v1/posts/sources", async (req, res) => {
+app.get("/api/v1/posts/sources", async (_req, res) => {
   try {
-    const { rows } = await pool.query(
-      "SELECT DISTINCT source_type FROM posts WHERE source_type IS NOT NULL ORDER BY source_type"
-    );
-    res.json(rows.map((r) => r.source_type));
+    const { rows } = await pool.query(`
+      SELECT source_type, COUNT(*)::int AS count, MAX(published_date) AS latest_published
+      FROM   content
+      WHERE  source_type IS NOT NULL
+      GROUP  BY source_type
+      ORDER  BY source_type
+    `);
+    res.json(rows);
   } catch (err) {
-    console.error("Error fetching sources:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/v1/posts/sources");
   }
 });
 
@@ -1136,11 +1628,12 @@ app.get("/api/v1/posts/sources", async (req, res) => {
  * @swagger
  * /api/v1/posts/tags:
  *   get:
- *     summary: Get all unique tags with counts
+ *     summary: List cluster tags with post counts
+ *     description: Every post has one cluster tag, a high-level category. Use the `tags` filter on /api/v1/posts to select by it.
  *     tags: [Metadata]
  *     responses:
  *       200:
- *         description: List of tags with post counts
+ *         description: Tags ordered by post count
  *         content:
  *           application/json:
  *             schema:
@@ -1153,19 +1646,71 @@ app.get("/api/v1/posts/sources", async (req, res) => {
  *                   count:
  *                     type: integer
  */
-app.get("/api/v1/posts/tags", async (req, res) => {
+app.get("/api/v1/posts/tags", async (_req, res) => {
   try {
     const { rows } = await pool.query(`
-      SELECT tag, COUNT(*)::int as count
-      FROM posts, unnest(feed_tags) as tag
-      WHERE tag IS NOT NULL
-      GROUP BY tag
-      ORDER BY count DESC, tag ASC
+      SELECT MIN(cluster_tag) AS tag, COUNT(*)::int AS count
+      FROM   content
+      WHERE  cluster_tag IS NOT NULL
+      GROUP  BY LOWER(cluster_tag)
+      ORDER  BY count DESC, tag ASC
     `);
     res.json(rows);
   } catch (err) {
-    console.error("Error fetching tags:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/v1/posts/tags");
+  }
+});
+
+/**
+ * @swagger
+ * /api/v1/posts/topics:
+ *   get:
+ *     summary: List topics with post counts
+ *     description: Posts carry several finer-grained topics. Use the `topics` filter on /api/v1/posts to select by them.
+ *     tags: [Metadata]
+ *     parameters:
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 1000
+ *           default: 100
+ *         description: Number of topics to return, most common first
+ *     responses:
+ *       200:
+ *         description: Topics ordered by post count
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: array
+ *               items:
+ *                 type: object
+ *                 properties:
+ *                   topic:
+ *                     type: string
+ *                   count:
+ *                     type: integer
+ *       400:
+ *         description: Invalid limit
+ */
+app.get("/api/v1/posts/topics", async (req, res) => {
+  try {
+    const limit = intParam(req.query, "limit", 100, 1, 1000);
+    const { rows } = await pool.query(
+      `
+      SELECT MIN(t) AS topic, COUNT(DISTINCT content.id)::int AS count
+      FROM   content, unnest(topics) AS t
+      WHERE  t IS NOT NULL AND t <> ''
+      GROUP  BY LOWER(t)
+      ORDER  BY count DESC, topic ASC
+      LIMIT  $1
+    `,
+      [limit]
+    );
+    res.json(rows);
+  } catch (err) {
+    sendError(res, err, "GET /api/v1/posts/topics");
   }
 });
 
@@ -1173,11 +1718,11 @@ app.get("/api/v1/posts/tags", async (req, res) => {
  * @swagger
  * /api/v1/posts/stats:
  *   get:
- *     summary: Get statistics about the posts
+ *     summary: Dataset statistics
  *     tags: [Metadata]
  *     responses:
  *       200:
- *         description: Statistics about posts
+ *         description: Totals and date range
  *         content:
  *           application/json:
  *             schema:
@@ -1186,6 +1731,8 @@ app.get("/api/v1/posts/tags", async (req, res) => {
  *                 total_posts:
  *                   type: integer
  *                 sources:
+ *                   type: integer
+ *                 tags:
  *                   type: integer
  *                 date_range:
  *                   type: object
@@ -1196,120 +1743,67 @@ app.get("/api/v1/posts/tags", async (req, res) => {
  *                     latest:
  *                       type: string
  *                       format: date-time
- *                 avg_reading_time:
- *                   type: number
+ *                 last_ingested:
+ *                   type: string
+ *                   format: date-time
+ *                   description: When the most recent post was added to the feed
  */
-app.get("/api/v1/posts/stats", async (req, res) => {
+app.get("/api/v1/posts/stats", async (_req, res) => {
   try {
-    const { rows } = await pool.query(`
-      SELECT 
-        COUNT(*)::int as total_posts,
-        COUNT(DISTINCT source_type)::int as sources,
-        MIN(published_date) as earliest,
-        MAX(published_date) as latest,
-        AVG(reading_time_minutes)::float as avg_reading_time
-      FROM posts
+    const {
+      rows: [s],
+    } = await pool.query(`
+      SELECT COUNT(*)::int                           AS total_posts,
+             COUNT(DISTINCT source_type)::int        AS sources,
+             COUNT(DISTINCT LOWER(cluster_tag))::int AS tags,
+             MIN(published_date)                     AS earliest,
+             MAX(published_date)                     AS latest,
+             MAX(created_at)                         AS last_ingested
+      FROM   content
     `);
-
     res.json({
-      total_posts: rows[0].total_posts,
-      sources: rows[0].sources,
-      date_range: {
-        earliest: rows[0].earliest,
-        latest: rows[0].latest,
-      },
-      avg_reading_time: rows[0].avg_reading_time,
+      total_posts: s.total_posts,
+      sources: s.sources,
+      tags: s.tags,
+      date_range: { earliest: s.earliest, latest: s.latest },
+      last_ingested: s.last_ingested,
     });
   } catch (err) {
-    console.error("Error fetching stats:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/v1/posts/stats");
   }
 });
 
 /**
  * @swagger
- * components:
- *   schemas:
- *     Post:
- *       type: object
- *       properties:
- *         id:
- *           type: integer
- *           description: Unique identifier
- *         uuid:
- *           type: string
- *           format: uuid
- *         title:
- *           type: string
- *         source_url:
- *           type: string
- *           format: uri
- *         source_type:
- *           type: string
- *           example: "EA Forum"
- *         published_date:
- *           type: string
- *           format: date-time
- *         authors_display:
- *           type: array
- *           items:
- *             type: string
- *         short_summary:
- *           type: string
- *         long_summary:
- *           type: string
- *         key_implication:
- *           type: string
- *         novelty_score:
- *           type: number
- *           minimum: 0
- *           maximum: 100
- *         feed_tags:
- *           type: array
- *           items:
- *             type: string
- *         reading_time_minutes:
- *           type: integer
- *         word_count:
- *           type: integer
- */
-
-/**
- * @swagger
  * /api/v1/posts:
  *   get:
- *     summary: Get posts with filtering and pagination
- *     description: Retrieve AI safety posts from various sources with optional filtering
+ *     summary: List posts with filtering and pagination
+ *     description: |
+ *       Returns curated AI safety posts (forum posts, blog posts, newsletters, podcast episodes) with AI-generated summaries, tags and novelty scores.
+ *       Results are newest-first by default. The article body is omitted unless `include_content=true`. The CSV export at `/api/content/export` and the RSS feed at `/rss.xml` accept the same filters.
  *     tags: [Posts]
  *     parameters:
+ *       - $ref: '#/components/parameters/search'
+ *       - $ref: '#/components/parameters/source_type'
+ *       - $ref: '#/components/parameters/sources'
+ *       - $ref: '#/components/parameters/tags'
+ *       - $ref: '#/components/parameters/topics'
+ *       - $ref: '#/components/parameters/novelty_min'
+ *       - $ref: '#/components/parameters/novelty_max'
+ *       - $ref: '#/components/parameters/published_after'
+ *       - $ref: '#/components/parameters/published_before'
  *       - in: query
- *         name: search
+ *         name: sort
  *         schema:
  *           type: string
- *         description: Search in title, summary, and authors
+ *           enum: [newest, oldest, novelty, random]
+ *           default: newest
  *       - in: query
- *         name: source_type
+ *         name: include_content
  *         schema:
- *           type: string
- *         description: Filter by source (e.g., "EA Forum", "LessWrong")
- *       - in: query
- *         name: tags
- *         schema:
- *           type: string
- *         description: Comma-separated list of feed tags
- *       - in: query
- *         name: novelty_min
- *         schema:
- *           type: integer
- *           minimum: 0
- *           maximum: 100
- *         description: Minimum novelty score
- *       - in: query
- *         name: published_after
- *         schema:
- *           type: string
- *           format: date
- *         description: Filter posts published after this date
+ *           type: boolean
+ *           default: false
+ *         description: Include full_content_markdown in each post
  *       - in: query
  *         name: limit
  *         schema:
@@ -1317,6 +1811,7 @@ app.get("/api/v1/posts/stats", async (req, res) => {
  *           minimum: 1
  *           maximum: 100
  *           default: 20
+ *         description: Page size; values above 100 are clamped
  *       - in: query
  *         name: offset
  *         schema:
@@ -1336,160 +1831,63 @@ app.get("/api/v1/posts/stats", async (req, res) => {
  *                   items:
  *                     $ref: '#/components/schemas/Post'
  *                 pagination:
- *                   type: object
- *                   properties:
- *                     total:
- *                       type: integer
- *                     limit:
- *                       type: integer
- *                     offset:
- *                       type: integer
- *                     hasMore:
- *                       type: boolean
+ *                   $ref: '#/components/schemas/Pagination'
+ *       400:
+ *         description: Invalid parameter value
  */
 app.get("/api/v1/posts", async (req, res) => {
   try {
-    const {
-      search,
-      source_type,
-      tags,
-      novelty_min,
-      published_after,
-      limit = 20,
-      offset = 0,
-    } = req.query;
+    const { whereSQL, params } = buildV1Where(req.query);
+    const orderSQL = sortParam(req.query);
+    const limit = intParam(req.query, "limit", 20, 1, 100);
+    const offset = intParam(req.query, "offset", 0, 0, Number.MAX_SAFE_INTEGER);
+    const cols = boolParam(req.query, "include_content")
+      ? V1_POST_COLS_WITH_CONTENT
+      : V1_POST_COLS;
 
-    // Build query
-    const conditions = [];
-    const params = [];
-    let paramIndex = 1;
-
-    // Search filter
-    if (search) {
-      conditions.push(`(
-        title ILIKE $${paramIndex} OR 
-        short_summary ILIKE $${paramIndex} OR 
-        long_summary ILIKE $${paramIndex} OR
-        array_to_string(authors_display, ' ') ILIKE $${paramIndex}
-      )`);
-      params.push(`%${search}%`);
-      paramIndex++;
-    }
-
-    // Source type filter
-    if (source_type) {
-      conditions.push(`source_type = $${paramIndex}`);
-      params.push(source_type);
-      paramIndex++;
-    }
-
-    // Tags filter
-    if (tags) {
-      const tagList = tags.split(",").map((t) => t.trim());
-      conditions.push(`feed_tags && $${paramIndex}::text[]`);
-      params.push(tagList);
-      paramIndex++;
-    }
-
-    // Novelty score filter
-    if (novelty_min) {
-      conditions.push(`novelty_score >= $${paramIndex}`);
-      params.push(parseInt(novelty_min));
-      paramIndex++;
-    }
-
-    // Date filter
-    if (published_after) {
-      conditions.push(`published_date >= $${paramIndex}`);
-      params.push(published_after);
-      paramIndex++;
-    }
-
-    // Build final query
-    let query = "SELECT * FROM posts";
-    if (conditions.length > 0) {
-      query += " WHERE " + conditions.join(" AND ");
-    }
-    query += ` ORDER BY published_date DESC LIMIT $${paramIndex} OFFSET $${
-      paramIndex + 1
-    }`;
-    params.push(parseInt(limit), parseInt(offset));
-
-    // Get total count
-    let countQuery = "SELECT COUNT(*) FROM posts";
-    if (conditions.length > 0) {
-      countQuery += " WHERE " + conditions.join(" AND ");
-    }
-    const countParams = params.slice(0, -2); // Remove limit and offset
-
-    // Execute queries
     const [dataResult, countResult] = await Promise.all([
-      pool.query(query, params),
-      pool.query(countQuery, countParams),
+      pool.query(
+        `SELECT ${cols} FROM content ${whereSQL}
+         ORDER BY ${orderSQL}
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]
+      ),
+      pool.query(`SELECT COUNT(*)::int AS total FROM content ${whereSQL}`, params),
     ]);
-
-    const total = parseInt(countResult.rows[0].count);
-
+    const total = countResult.rows[0].total;
     res.json({
       data: dataResult.rows,
       pagination: {
         total,
-        limit: parseInt(limit),
-        offset: parseInt(offset),
-        hasMore: offset + limit < total,
+        limit,
+        offset,
+        hasMore: offset + dataResult.rows.length < total,
       },
     });
   } catch (err) {
-    console.error("Error fetching posts:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/v1/posts");
   }
 });
 
-/**
- * @swagger
- * /api/v1/posts/{id}:
- *   get:
- *     summary: Get a single post by ID
- *     tags: [Posts]
- *     parameters:
- *       - in: path
- *         name: id
- *         required: true
- *         schema:
- *           type: integer
- *         description: Post ID
- *     responses:
- *       200:
- *         description: Success
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Post'
- *       404:
- *         description: Post not found
- */
-app.get("/api/v1/posts/:id", async (req, res) => {
+async function sendSinglePost(res, whereSQL, param, label) {
   try {
-    const { rows } = await pool.query("SELECT * FROM posts WHERE id = $1", [
-      req.params.id,
-    ]);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Post not found" });
-    }
-
+    const { rows } = await pool.query(
+      `SELECT ${V1_POST_COLS_WITH_CONTENT} FROM content WHERE ${whereSQL}`,
+      [param]
+    );
+    if (!rows.length) return res.status(404).json({ error: "Post not found" });
     res.json(rows[0]);
   } catch (err) {
-    console.error("Error fetching post:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, label);
   }
-});
+}
 
 /**
  * @swagger
  * /api/v1/posts/by-uuid/{uuid}:
  *   get:
  *     summary: Get a single post by UUID
+ *     description: Includes the article body (full_content_markdown).
  *     tags: [Posts]
  *     parameters:
  *       - in: path
@@ -1498,7 +1896,6 @@ app.get("/api/v1/posts/:id", async (req, res) => {
  *         schema:
  *           type: string
  *           format: uuid
- *         description: Post UUID
  *     responses:
  *       200:
  *         description: Success
@@ -1506,25 +1903,249 @@ app.get("/api/v1/posts/:id", async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Post'
+ *       400:
+ *         description: Malformed UUID
  *       404:
  *         description: Post not found
  */
-app.get("/api/v1/posts/by-uuid/:uuid", async (req, res) => {
-  try {
-    const { rows } = await pool.query("SELECT * FROM posts WHERE uuid = $1", [
-      req.params.uuid,
-    ]);
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Post not found" });
-    }
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("Error fetching post by UUID:", err);
-    res.status(500).json({ error: "Internal server error" });
+app.get("/api/v1/posts/by-uuid/:uuid", (req, res) => {
+  if (!UUID_RE.test(req.params.uuid)) {
+    return res.status(400).json({ error: "uuid must be a valid UUID" });
   }
+  return sendSinglePost(res, "uuid = $1", req.params.uuid, "GET /api/v1/posts/by-uuid");
 });
+
+/**
+ * @swagger
+ * /api/v1/posts/{id}:
+ *   get:
+ *     summary: Get a single post by ID
+ *     description: Includes the article body (full_content_markdown).
+ *     tags: [Posts]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *     responses:
+ *       200:
+ *         description: Success
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Post'
+ *       400:
+ *         description: Non-integer id
+ *       404:
+ *         description: Post not found
+ */
+app.get("/api/v1/posts/:id", (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) {
+    return res.status(400).json({ error: "id must be a non-negative integer" });
+  }
+  const id = Number(req.params.id);
+  if (id > PG_INT4_MAX) return res.status(404).json({ error: "Post not found" });
+  return sendSinglePost(res, "id = $1", id, "GET /api/v1/posts/:id");
+});
+
+// ---------------------------------------------------------------------------
+// RSS feed
+// ---------------------------------------------------------------------------
+
+const SITE_URL = "https://aisafetyfeed.com";
+
+// Characters XML 1.0 forbids even inside CDATA (control chars, lone
+// surrogates). A single one anywhere makes the whole feed unparseable.
+const XML_INVALID_CHARS = /[^\t\n\r\x20-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/gu;
+const xmlSafe = (s) => String(s ?? "").replace(XML_INVALID_CHARS, "");
+const xmlText = (s) => escapeHtml(xmlSafe(s));
+const cdata = (s) => `<![CDATA[${xmlSafe(s).replace(/]]>/g, "]]]]><![CDATA[>")}]]>`;
+
+// The paragraph summaries are light markdown: blank-line paragraphs, "* "
+// bullets and **bold**. Render just that much into HTML for feed readers.
+function summaryMarkdownToHtml(text) {
+  if (!text) return "";
+  const out = [];
+  let para = [];
+  let inList = false;
+  const flushPara = () => {
+    if (para.length) out.push(`<p>${para.join(" ")}</p>`);
+    para = [];
+  };
+  const closeList = () => {
+    if (inList) out.push("</ul>");
+    inList = false;
+  };
+  for (const raw of escapeHtml(String(text)).split(/\r?\n/)) {
+    const line = raw.trim();
+    const bullet = line.match(/^[*\-]\s+(.*)$/);
+    if (bullet) {
+      flushPara();
+      if (!inList) out.push("<ul>");
+      inList = true;
+      out.push(`<li>${bullet[1]}</li>`);
+    } else if (!line) {
+      flushPara();
+      closeList();
+    } else {
+      closeList();
+      para.push(line);
+    }
+  }
+  flushPara();
+  closeList();
+  return out.join("\n").replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+}
+
+function buildRssXml({ title, description, selfUrl, posts }) {
+  const items = posts
+    .map((p) => {
+      const displayTitle = getDisplayTitle(p);
+      const similarUrl = generateSimilarUrl(p, SITE_URL);
+      const authors = (p.authors || []).filter(Boolean);
+      const categories = [p.cluster_tag, ...(p.topics || [])].filter(Boolean);
+
+      const body = [];
+      if (p.sentence_summary) {
+        body.push(`<p><strong>${escapeHtml(p.sentence_summary)}</strong></p>`);
+      }
+      if (p.paragraph_summary) body.push(summaryMarkdownToHtml(p.paragraph_summary));
+      if (p.key_implication) {
+        body.push(`<p><em>Key implication:</em> ${escapeHtml(p.key_implication)}</p>`);
+      }
+      const meta = [];
+      if (p.source_type) meta.push(escapeHtml(p.source_type));
+      if (authors.length) meta.push(escapeHtml(authors.join(", ")));
+      if (p.novelty_score != null) meta.push(`Novelty ${Math.round(p.novelty_score)}/100`);
+      meta.push(`<a href="${escapeHtml(similarUrl)}">Similar posts on AI Safety Feed</a>`);
+      body.push(`<p><small>${meta.join(" | ")}</small></p>`);
+
+      return [
+        "    <item>",
+        `      <title>${xmlText(displayTitle)}</title>`,
+        `      <link>${xmlText(p.source_url || similarUrl)}</link>`,
+        `      <guid isPermaLink="false">${xmlText(p.uuid || `aisafetyfeed-content-${p.id}`)}</guid>`,
+        p.published_date
+          ? `      <pubDate>${new Date(p.published_date).toUTCString()}</pubDate>`
+          : null,
+        authors.length ? `      <dc:creator>${xmlText(authors.join(", "))}</dc:creator>` : null,
+        ...categories.map((c) => `      <category>${xmlText(c)}</category>`),
+        `      <description>${xmlText(p.sentence_summary || p.key_implication || "")}</description>`,
+        `      <content:encoded>${cdata(body.join("\n"))}</content:encoded>`,
+        "    </item>",
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n");
+
+  // Derive lastBuildDate from the data, not the clock, so an unchanged feed
+  // produces byte-identical output and feed readers get 304s from the ETag.
+  const newest = posts.reduce((acc, p) => {
+    const t = new Date(p.updated_at || p.created_at || p.published_date || 0).getTime();
+    return Number.isFinite(t) && t > acc ? t : acc;
+  }, 0);
+  const lastBuild = new Date(newest || Date.now()).toUTCString();
+
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0"
+     xmlns:atom="http://www.w3.org/2005/Atom"
+     xmlns:content="http://purl.org/rss/1.0/modules/content/"
+     xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>${xmlText(title)}</title>
+    <link>${SITE_URL}</link>
+    <description>${xmlText(description)}</description>
+    <language>en-us</language>
+    <lastBuildDate>${lastBuild}</lastBuildDate>
+    <ttl>60</ttl>
+    <atom:link href="${xmlText(selfUrl)}" rel="self" type="application/rss+xml"/>
+${items}
+  </channel>
+</rss>
+`;
+}
+
+/**
+ * @swagger
+ * /rss.xml:
+ *   get:
+ *     summary: RSS 2.0 feed of the latest posts
+ *     description: |
+ *       Subscribe in any feed reader. Accepts the same filters as /api/v1/posts, so you can build a feed for one source or tag, e.g. `/rss.xml?source_type=Less Wrong` or `/rss.xml?tags=technical ml safety&novelty_min=60`.
+ *       Items are ordered by when they were added to the feed (so a podcast transcribed a few days late still shows up), each links to the original post, and the body carries the AI-generated summaries. Also served at `/feed.xml`.
+ *     tags: [Feeds]
+ *     parameters:
+ *       - $ref: '#/components/parameters/search'
+ *       - $ref: '#/components/parameters/source_type'
+ *       - $ref: '#/components/parameters/sources'
+ *       - $ref: '#/components/parameters/tags'
+ *       - $ref: '#/components/parameters/topics'
+ *       - $ref: '#/components/parameters/novelty_min'
+ *       - $ref: '#/components/parameters/novelty_max'
+ *       - $ref: '#/components/parameters/published_after'
+ *       - $ref: '#/components/parameters/published_before'
+ *       - in: query
+ *         name: limit
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 100
+ *           default: 50
+ *     responses:
+ *       200:
+ *         description: RSS document
+ *         content:
+ *           application/rss+xml:
+ *             schema:
+ *               type: string
+ *       400:
+ *         description: Invalid parameter value
+ */
+async function rssHandler(req, res) {
+  try {
+    const { whereSQL, params } = buildV1Where(req.query);
+    const limit = intParam(req.query, "limit", 50, 1, 100);
+
+    const apiBase = (
+      process.env.API_BASE_URL ||
+      process.env.BACKEND_URL ||
+      `${req.protocol}://${req.get("host")}`
+    ).replace(/\/$/, "");
+
+    const sources = [
+      ...listParam(req.query, "source_type", { split: false }),
+      ...listParam(req.query, "sources", { split: true }),
+    ];
+    const tags = listParam(req.query, "tags", { split: true });
+    let title = "AI Safety Feed";
+    if (sources.length) title += ` - ${sources.join(", ")}`;
+    if (tags.length) title += ` - ${tags.join(", ")}`;
+
+    // id is a serial, so id DESC is ingestion order.
+    const { rows } = await pool.query(
+      `SELECT ${V1_POST_COLS} FROM content ${whereSQL}
+       ORDER BY id DESC
+       LIMIT $${params.length + 1}`,
+      [...params, limit]
+    );
+    const xml = buildRssXml({
+      title,
+      description:
+        "Curated AI safety posts, papers, newsletters and podcast episodes with AI-generated summaries and novelty scores.",
+      selfUrl: apiBase + req.originalUrl,
+      posts: rows,
+    });
+    res.set("Content-Type", "application/rss+xml; charset=utf-8");
+    res.set("Cache-Control", "public, max-age=900");
+    res.send(xml);
+  } catch (err) {
+    sendError(res, err, "GET /rss.xml");
+  }
+}
+app.get("/rss.xml", rssHandler);
+app.get("/feed.xml", rssHandler);
 
 // --- Email Subscription Endpoints ---
 
@@ -1661,7 +2282,7 @@ app.get("/api/content/:id", async (req, res) => {
   try {
     const {
       rows: [post],
-    } = await pool.query("SELECT * FROM content WHERE id=$1", [req.params.id]);
+    } = await pool.query(`SELECT ${CONTENT_COLS} FROM content WHERE id=$1`, [req.params.id]);
     if (post) {
       res.json(post);
     } else {
@@ -1947,7 +2568,10 @@ cron.schedule(
 
 console.log(`Batched email digest cron job scheduled.`);
 
-// Start the server and listen on the defined port
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+// Load the content column list first so no request is served with SELECT *
+// (falls back to "*" with a logged error if information_schema can't be read).
+loadContentColumns().finally(() => {
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+  });
 });
