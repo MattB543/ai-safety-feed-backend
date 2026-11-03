@@ -1843,7 +1843,7 @@ app.post("/api/subscribe", async (req, res) => {
   if (
     !email ||
     typeof email !== "string" ||
-    !/^[\w-\.]+@([\w-]+\.)+[\w-]{2,4}$/.test(email)
+    !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)
   ) {
     return res.status(400).json({ error: "Valid email address is required." });
   }
