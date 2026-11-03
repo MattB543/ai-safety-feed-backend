@@ -708,6 +708,10 @@ function csvCell(v) {
   if (v instanceof Date) s = v.toISOString();
   else if (typeof v === "object") s = JSON.stringify(v);
   else s = String(v);
+  // Spreadsheets run text starting with = + - @ (or tab/CR) as a formula, and
+  // titles and summaries are scraped text. A leading ' makes it plain text.
+  // Real numbers (e.g. a negative score) can't be formulas and stay numeric.
+  if (typeof v !== "number" && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
