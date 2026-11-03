@@ -7,7 +7,6 @@ const rateLimit = require("express-rate-limit");
 const QueryStream = require("pg-query-stream");
 const { Transform } = require("stream");
 const { pipeline } = require("stream/promises");
-const fs = require("fs");
 const postmark = require("postmark");
 const { v4: uuidv4 } = require("uuid");
 const cron = require("node-cron"); // Import node-cron
@@ -184,11 +183,6 @@ console.log(
   process.env.PG_URL ? "Loaded" : "MISSING or undefined!"
 ); // Check if the env var is loaded
 
-let caCert;
-const caPath = __dirname + "/ca-certificate.crt";
-caCert = fs.readFileSync(caPath).toString();
-
-// Now create the pool using the loaded cert
 const pool = new Pool({
   connectionString: process.env.PG_URL,
   ssl: {
