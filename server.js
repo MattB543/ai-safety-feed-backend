@@ -286,44 +286,6 @@ app.use(
   })
 );
 
-// Helper function to build WHERE clause and parameters for list endpoints
-function buildWhere({ search, sources }) {
-  const clauses = [];
-  const params = [];
-  let i = 1;
-
-  if (search) {
-    clauses.push(`(
-        title ILIKE $${i} OR
-        array_to_string(authors,' ') ILIKE $${i} OR
-        sentence_summary ILIKE $${i} OR
-        paragraph_summary ILIKE $${i} OR
-        array_to_string(topics,' ') ILIKE $${i} OR
-        why_valuable ILIKE $${i} OR
-        unique_aspects ILIKE $${i} OR
-        author_credentials ILIKE $${i} OR
-        cluster_tag ILIKE $${i}
-      )`);
-    params.push(`%${search}%`); // Add wildcards for partial match
-    i++;
-  }
-
-  if (sources) {
-    const list = sources
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean); // Split, trim, and remove empty strings
-    if (list.length) {
-      clauses.push(`source_type = ANY($${i}::text[])`); // Use ANY operator for array comparison
-      params.push(list);
-      i++;
-    }
-  }
-
-  const whereSQL = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
-  return { whereSQL, params };
-}
-
 // Helper to generate HTML (extracted from sendDigestEmail)
 function generateDigestHtml(subscription, newContent) {
   // Determine the base URL for links
@@ -653,41 +615,23 @@ app.get("/api/sources", async (req, res) => {
   }
 });
 
-// NEW endpoint → returns [{ source_type: 'EA Forum', count: 52 }, …]
+// Post counts per source → [{ source_type: 'EA Forum', count: 52 }, …].
+// Takes the same filters as /api/v1/posts, so the website's source counts
+// follow its search, tag and novelty filters.
 app.get("/api/source-stats", async (req, res) => {
   try {
-    const { search, sources, tags } = req.query;
-    const { whereSQL: base, params } = buildWhere({ search, sources });
-
-    // --- add tag filter (same pattern as /api/content) ---
-    let tagSQL = "";
-    if (tags) {
-      const list = tags
-        .split(",")
-        .map((t) => t.trim().toLowerCase())
-        .filter(Boolean);
-      if (list.length) {
-        tagSQL =
-          (base ? " AND " : "WHERE ") +
-          `
-            LOWER(cluster_tag) = ANY($${params.length + 1}::text[])
-          `;
-        params.push(list);
-      }
-    }
-
-    const sql = `
-        SELECT source_type, COUNT(*)::int AS count
-        FROM   content
-        ${base} ${tagSQL}
-        GROUP  BY source_type
-        ORDER  BY source_type
-      `;
-    const result = await pool.query(sql, params);
-    res.json(result.rows); // → [{source_type, count}, …]
+    const { whereSQL, params } = buildV1Where(req.query);
+    const { rows } = await pool.query(
+      `SELECT source_type, COUNT(*)::int AS count
+         FROM content
+         ${whereSQL}
+        GROUP BY source_type
+        ORDER BY source_type`,
+      params
+    );
+    res.json(rows);
   } catch (err) {
-    console.error("Error fetching source stats:", err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/source-stats");
   }
 });
 
@@ -710,139 +654,71 @@ app.get("/api/tags", async (_req, res) => {
   }
 });
 
-// Endpoint to fetch content from database
+// DEPRECATED: the feed endpoint of the pre-cleanup website, which now uses
+// /api/v1/posts. Delete once the new frontend is live on Netlify.
+// Maps the old params (comma-separated sources and tags, novelty_bucket 1-5,
+// order_by=random) onto the v1 helpers and returns a bare array.
 app.get("/api/content", async (req, res) => {
-  const { search, sources, tags, novelty_bucket, order_by } = req.query;
-  const limit = parseInt(req.query.limit) || 50; // Default limit to 50
-  const offset = parseInt(req.query.offset) || 0; // Default offset to 0
-
-  const { whereSQL: searchSourceWhereSQL, params: searchSourceParams } =
-    buildWhere({ search, sources });
-
-  const conditions = [];
-  const finalParams = [...searchSourceParams]; // Start with params from buildWhere
-
-  if (searchSourceWhereSQL) {
-    conditions.push(searchSourceWhereSQL.replace(/^WHERE /, "")); // Add search/source conditions (remove WHERE)
-  }
-
-  let tagList = [];
-  if (tags) {
-    tagList = tags
-      .split(",")
-      .map((t) => t.trim().toLowerCase()) // Convert tags to lowercase
-      .filter(Boolean);
-
-    if (tagList.length > 0) {
-      const nextParamIndex = finalParams.length + 1;
-      conditions.push(`
-          LOWER(cluster_tag) = ANY($${nextParamIndex}::text[])
-        `);
-      finalParams.push(tagList); // Add lowercased tagList to final parameters
-    }
-  }
-
-  // Add novelty_bucket filter if provided.
-  // The bucket is a MINIMUM, not an exclusive band: the frontend presents this
-  // as "N and above" (e.g. "Novelty 4+"), so bucket 4 must still include 5/5
-  // posts. Bucket N maps to a floor on novelty_score and has no upper bound.
-  if (novelty_bucket) {
-    const bucket = parseInt(novelty_bucket);
-    let minScore = 0;
-    switch (bucket) {
-      case 2:
-        minScore = 21;
-        break;
-      case 3:
-        minScore = 41;
-        break;
-      case 4:
-        minScore = 71;
-        break;
-      case 5:
-        minScore = 91;
-        break;
-      // case 1 and default: minScore = 0 (no effective floor)
-      case 1:
-        minScore = 0;
-        break;
-    }
-
-    conditions.push(`novelty_score >= $${finalParams.length + 1}`);
-    finalParams.push(minScore);
-  }
-
-  let query = `SELECT
-    id, title, sentence_summary, paragraph_summary, key_implication,
-    novelty_score, novelty_note,
-    image_url, source_url, source_type,
-    authors, topics, cluster_tag, published_date,
-    cleaned_title, cleaned_image, image_prompt
-  FROM content`;
-  if (conditions.length > 0) {
-    // Join conditions with AND, prepending WHERE
-    query += " WHERE " + conditions.join(" AND "); // filters here
-  }
-
-  // Determine the ORDER BY clause
-  if (order_by === "random") {
-    query += " ORDER BY RANDOM()"; // <-- Add random ordering
-  } else {
-    query += " ORDER BY published_date DESC"; // Default ordering
-  }
-
-  // Add LIMIT and OFFSET for pagination
-  const limitParamIndex = finalParams.length + 1;
-  query += ` LIMIT $${limitParamIndex}`;
-  finalParams.push(limit);
-
-  const offsetParamIndex = finalParams.length + 1;
-  query += ` OFFSET $${offsetParamIndex}`;
-  finalParams.push(offset);
-
   try {
-    const result = await pool.query(query, finalParams);
-    return res.status(200).json(result.rows);
+    const q = req.query;
+    const noveltyMin = noveltyBucketMin(scalarParam(q, "novelty_bucket"));
+    const { whereSQL, params } = buildV1Where({
+      search: q.search,
+      sources: q.sources,
+      tags: q.tags,
+      novelty_min: noveltyMin === undefined ? undefined : String(noveltyMin),
+    });
+    const orderSQL = sortParam({
+      sort: scalarParam(q, "order_by") === "random" ? "random" : "newest",
+    });
+    const limit = intParam(q, "limit", 50, 1, 100);
+    const offset = intParam(q, "offset", 0, 0, Number.MAX_SAFE_INTEGER);
+
+    const { rows } = await pool.query(
+      `SELECT ${V1_POST_COLS} FROM content ${whereSQL}
+       ORDER BY ${orderSQL}
+       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+      [...params, limit, offset]
+    );
+    res.json(rows);
   } catch (err) {
-    console.error("Error fetching content:", err);
-    console.error("Faulty Query:", query); // Log the query on error
-    console.error("Parameters:", finalParams); // Log the parameters on error
-    return res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/content");
   }
 });
 
-// NEW endpoint to fetch multiple posts by a list of IDs
+// Posts by id, for the website's bookmarks: ?ids=1,2,3 (or repeat the key).
+// Returns a bare array in no particular order; unknown ids are left out.
+const MAX_BY_IDS = 100;
 app.get("/api/content/by-ids", async (req, res) => {
-  const { ids } = req.query;
-
-  if (!ids) {
+  const raw = listParam(req.query, "ids", { split: true });
+  if (!raw.length) {
     return res.status(400).json({ error: "Missing 'ids' query parameter" });
   }
-
-  // Split the comma-separated string and convert to numbers, filtering out invalid entries
-  const idList = ids
-    .split(",")
-    .map((id) => parseInt(id.trim()))
-    .filter((id) => !isNaN(id) && id > 0);
-
-  if (idList.length === 0) {
-    // Handle cases where no valid IDs were provided after filtering
+  if (raw.length > MAX_BY_IDS) {
+    return res.status(400).json({ error: `At most ${MAX_BY_IDS} ids per request` });
+  }
+  const idList = [
+    ...new Set(
+      raw
+        .filter((s) => /^\d+$/.test(s))
+        .map(Number)
+        .filter((id) => id > 0 && id <= PG_INT4_MAX)
+    ),
+  ];
+  if (!idList.length) {
     return res
       .status(400)
       .json({ error: "No valid IDs provided in 'ids' query parameter" });
   }
 
   try {
-    // Use ANY operator for efficient querying with an array of IDs
-    const query = `SELECT ${CONTENT_COLS} FROM content WHERE id = ANY($1::int[])`;
-    const { rows } = await pool.query(query, [idList]);
-
-    // Return the found posts. It might be an empty array if none of the IDs matched.
+    const { rows } = await pool.query(
+      `SELECT ${V1_POST_COLS} FROM content WHERE id = ANY($1::int[])`,
+      [idList]
+    );
     res.json(rows);
   } catch (err) {
-    console.error("Error fetching content by IDs:", err);
-    console.error("Query Parameters (parsed):", idList); // Log the parsed IDs
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/content/by-ids");
   }
 });
 
@@ -1023,8 +899,9 @@ app.get("/api/similar/:id/ai", similarHandler);
 
 // Fields exposed by the public API and the CSV export, in output order. The
 // article body (full_content_markdown) is added only where documented. The
-// embedding vectors and internal columns (title_norm, image_prompt,
-// full_content, content_snippet) are never exposed.
+// embedding vectors and internal columns (title_norm, full_content,
+// content_snippet) are never exposed. image_prompt is included because the
+// website shows it as the card image's tooltip.
 const V1_POST_FIELDS = [
   "id",
   "uuid",
@@ -1046,6 +923,7 @@ const V1_POST_FIELDS = [
   "topics",
   "image_url",
   "cleaned_image",
+  "image_prompt",
   "audio_url",
   "score",
   "comment_count",
@@ -1142,9 +1020,31 @@ function sortParam(q) {
   return V1_SORTS[v];
 }
 
+// The website's 1-5 novelty buckets are minimums ("4+" includes 5/5 posts):
+// bucket N maps to a floor on novelty_score. Bucket 1 has no floor.
+const NOVELTY_BUCKET_MIN = { 2: 21, 3: 41, 4: 71, 5: 91 };
+
+// Floor for a bucket, or undefined for bucket 1 / no bucket / junk input.
+function noveltyBucketMin(bucket) {
+  return NOVELTY_BUCKET_MIN[Number(bucket)];
+}
+
+// Inverse: which 1-5 bucket a 0-100 score falls in.
+function noveltyBucketOf(score) {
+  let bucket = 1;
+  for (const [b, min] of Object.entries(NOVELTY_BUCKET_MIN)) {
+    if (score >= min) bucket = Number(b);
+  }
+  return bucket;
+}
+
+// Longer search strings are truncated; ILIKE over several columns gets slow.
+const MAX_SEARCH_LENGTH = 200;
+
 /**
- * WHERE clause shared by /api/v1/posts, /api/content/export and /rss.xml.
- * Throws ValidationError on bad input.
+ * WHERE clause shared by every list endpoint: /api/v1/posts, the legacy
+ * /api/content, /api/source-stats, /api/content/export, /rss.xml and the
+ * email digest. Throws ValidationError on bad input.
  */
 function buildV1Where(q) {
   const clauses = [];
@@ -1154,7 +1054,7 @@ function buildV1Where(q) {
     clauses.push(sql(params.length));
   };
 
-  const search = scalarParam(q, "search");
+  const search = scalarParam(q, "search")?.slice(0, MAX_SEARCH_LENGTH);
   if (search) {
     add(
       `%${search}%`,
@@ -1285,6 +1185,10 @@ function buildV1Where(q) {
  *           type: string
  *           format: uri
  *           nullable: true
+ *         image_prompt:
+ *           type: string
+ *           nullable: true
+ *           description: Text prompt the post's generated image was made from; the website uses it as the image's alt text and tooltip
  *         audio_url:
  *           type: string
  *           format: uri
@@ -1326,7 +1230,7 @@ function buildV1Where(q) {
  *       name: search
  *       schema:
  *         type: string
- *       description: Case-insensitive substring match on title, summaries, key implication, authors, topics and tag
+ *       description: Case-insensitive substring match on title, summaries, key implication, authors, topics and tag. Truncated to 200 characters.
  *     source_type:
  *       in: query
  *       name: source_type
