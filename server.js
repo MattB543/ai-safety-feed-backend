@@ -198,25 +198,6 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
-// Columns of public.content minus the two 1536-dim vectors. Most endpoints
-// never need the vectors, and SELECT * shipped ~30-60 KB of them per row.
-let CONTENT_COLS = "*";
-async function loadContentColumns() {
-  try {
-    const { rows } = await pool.query(
-      `SELECT column_name FROM information_schema.columns
-        WHERE table_schema = 'public' AND table_name = 'content'
-          AND column_name NOT IN ('embedding_short', 'embedding_full')
-        ORDER BY ordinal_position`
-    );
-    if (rows.length) {
-      CONTENT_COLS = rows.map((r) => `"${r.column_name}"`).join(", ");
-    }
-  } catch (err) {
-    console.error("Could not load content columns; falling back to SELECT *:", err.message);
-  }
-}
-
 // Add error handler for the pool
 pool.on("error", (err) => {
   // Add more detail to the pool error logging
@@ -1983,21 +1964,26 @@ app.get("/api/unsubscribe/:token", async (req, res) => {
   }
 });
 
-// NEW endpoint to fetch a single post by ID
-// NOTE: This must come *after* /api/content/by-ids to avoid conflict
+// Single post by id, without the article body (the old Similar page's
+// reference card). The new frontend uses /api/v1/posts/:id instead.
+// NOTE: This must come *after* /api/content/by-ids and /export to avoid conflict
 app.get("/api/content/:id", async (req, res) => {
+  if (!/^\d+$/.test(req.params.id)) {
+    return res.status(400).json({ error: "id must be a non-negative integer" });
+  }
+  const id = Number(req.params.id);
+  if (id > PG_INT4_MAX) return res.sendStatus(404);
   try {
     const {
       rows: [post],
-    } = await pool.query(`SELECT ${CONTENT_COLS} FROM content WHERE id=$1`, [req.params.id]);
+    } = await pool.query(`SELECT ${V1_POST_COLS} FROM content WHERE id = $1`, [id]);
     if (post) {
       res.json(post);
     } else {
       res.sendStatus(404);
     }
   } catch (err) {
-    console.error(`Error fetching content with ID ${req.params.id}:`, err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/content/:id");
   }
 });
 
@@ -2275,10 +2261,6 @@ cron.schedule(
 
 console.log(`Batched email digest cron job scheduled.`);
 
-// Load the content column list first so no request is served with SELECT *
-// (falls back to "*" with a logged error if information_schema can't be read).
-loadContentColumns().finally(() => {
-  app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-  });
+app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
 });
