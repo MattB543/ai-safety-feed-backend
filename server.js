@@ -15,12 +15,6 @@ const cron = require("node-cron"); // Import node-cron
 const swaggerJsdoc = require("swagger-jsdoc");
 const swaggerUi = require("swagger-ui-express");
 
-const OpenAI = require("openai");
-const openai = new OpenAI({
-  apiKey: process.env.OPEN_AI_FREE_CREDITS_KEY,
-});
-const GPT_MODEL = "gpt-4.1";
-
 // Initialize Postmark Client
 let postmarkClient;
 if (process.env.POSTMARK_API_KEY) {
@@ -328,37 +322,6 @@ function buildWhere({ search, sources }) {
 
   const whereSQL = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
   return { whereSQL, params };
-}
-
-// Helper function to build the prompt for reranking candidates
-function buildRerankPrompt(ref, candidates) {
-  const refBlock = `REFERENCE ARTICLE
-  ID: ${ref.id}
-  Title: ${ref.title}
-  Summary: ${ref.sentence_summary || ""}
-  Main points: ${ref.paragraph_summary || ""}
-  Key implication: ${ref.key_implication || ""}`.trim();
-
-  const candBlocks = candidates
-    .map((c, i) =>
-      `---
-  ID: ${c.id}
-  Title: ${c.title}
-  Summary: ${c.sentence_summary || ""}
-  Main points: ${c.paragraph_summary || ""}
-  Key implication: ${c.key_implication || ""}`.trim()
-    )
-    .join("\n\n");
-
-  return `
-  ${refBlock}
-
-  ${candBlocks}
-
-  TASK
-  Based on semantic similarity (considering topics, summaries, implications, etc.), return a JSON array only with 10 to 15 candidate IDs, ordered most similar to least similar when compared to the REFERENCE ARTICLE.
-  Ensure the output is only the JSON array (e.g., ["id1", "id2", ...]) with no other text, commentary, or formatting like back-ticks.
-  `.trim();
 }
 
 // Helper to generate HTML (extracted from sendDigestEmail)
@@ -998,219 +961,59 @@ app.get("/api/content/export", async (req, res) => {
   }
 });
 
-// Helper function to find vector similar candidates
-async function findVectorSimilarCandidates(id, k) {
-  console.log(`[findVectorSimilarCandidates/${id}] Fetching reference post...`);
-  const {
-    rows: [ref],
-  } = await pool.query(
-    "SELECT * FROM content WHERE id=$1 AND embedding_short IS NOT NULL AND embedding_full IS NOT NULL",
-    [id]
-  );
-  if (!ref) {
-    console.log(
-      `[findVectorSimilarCandidates/${id}] Reference post not found.`
-    );
-    return { ref: null, candidates: [], error: "Post not found", status: 404 };
+// Similar posts: nearest neighbours by cosine distance over both embeddings.
+// Each embedding gets its own KNN query (so pgvector can use its index), and a
+// post found by both keeps its smaller distance.
+const SIMILAR_LIMIT = 20;
+
+async function similarHandler(req, res) {
+  if (!/^\d+$/.test(req.params.id)) {
+    return res.status(400).json({ error: "id must be a non-negative integer" });
   }
-  console.log(
-    `[findVectorSimilarCandidates/${id}] Found reference post: ${ref.title}`
-  );
-
-  // pgvector nearest-neighbour union
-  console.log(
-    `[findVectorSimilarCandidates/${id}] Fetching ${k} candidates via vector search...`
-  );
-  const { rows: cands } = await pool.query(
-    `
-      (SELECT ${CONTENT_COLS}, embedding_short <=> $1 AS dist
-        FROM content
-        WHERE id <> $3 AND embedding_short IS NOT NULL
-    ORDER BY embedding_short <=> $1
-        LIMIT $2)
-      UNION ALL
-      (SELECT ${CONTENT_COLS}, embedding_full  <=> $4 AS dist
-        FROM content
-        WHERE id <> $3 AND embedding_full IS NOT NULL
-    ORDER BY embedding_full  <=> $4
-        LIMIT $2)
-      `,
-    [ref.embedding_short, k, id, ref.embedding_full]
-  );
-  console.log(
-    `[findVectorSimilarCandidates/${id}] Found ${cands.length} candidates before deduplication.`
-  );
-
-  // Deduplicate candidates based on ID, keeping the entry with the MINIMUM distance
-  const uniqueCandsMap = new Map();
-  cands.forEach((cand) => {
-    const existingCand = uniqueCandsMap.get(cand.id);
-    if (!existingCand || cand.dist < existingCand.dist) {
-      uniqueCandsMap.set(cand.id, cand);
-    }
-  });
-  const uniqueCands = Array.from(uniqueCandsMap.values());
-  console.log(
-    `[findVectorSimilarCandidates/${id}] Deduplicated to ${uniqueCands.length} unique candidates (kept version with min distance).`
-  );
-
-  return { ref, candidates: uniqueCands, error: null, status: 200 };
-}
-
-// --- Endpoint for AI Re-ranked Similar Posts ---
-app.get("/api/similar/:id/ai", async (req, res) => {
-  const { id } = req.params;
-  const k = 20; // candidates for AI rerank
-  const n = 20; // final results
-  console.log(`[similar/${id}/ai] START: k=${k}, n=${n}`);
+  const id = Number(req.params.id);
+  if (id > PG_INT4_MAX) return res.status(404).json({ error: "Post not found" });
 
   try {
-    // 1. Get reference and candidates using the helper
     const {
-      ref,
-      candidates: uniqueCands,
-      error,
-      status,
-    } = await findVectorSimilarCandidates(id, k);
-
-    if (error) {
-      return res.status(status).json({ error });
-    }
-
-    /* ---------- 2. GPT re-rank ---------- */
-    let finalIds = [];
-    if (openai && GPT_MODEL && uniqueCands.length > 0) {
-      const prompt = buildRerankPrompt(ref, uniqueCands);
-      console.log(
-        `[similar/${id}/ai] Sending prompt to OpenAI for reranking ${uniqueCands.length} candidates down to ${n}...`
-      );
-      // console.log(`[similar/${id}/ai] OpenAI Prompt:\n${prompt}`); // Uncomment for full prompt
-
-      try {
-        const resp = await openai.chat.completions.create({
-          model: GPT_MODEL,
-          temperature: 0.1,
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are a 'Post Similarity Ranking' service that returns ONLY a JSON array of candidate IDs.",
-            },
-            { role: "user", content: prompt },
-          ],
-        });
-        const openaiResponseText = resp.choices[0].message.content;
-        console.log(
-          `[similar/${id}/ai] OpenAI raw response: ${openaiResponseText}`
-        );
-
-        // Extract the JSON array part robustly
-        const jsonMatch = openaiResponseText.match(/(\[[\s\S]*?\])/); // More robust regex to find the array
-        if (jsonMatch && jsonMatch[1]) {
-          try {
-            finalIds = JSON.parse(jsonMatch[1]);
-            // Ensure we only take up to 'n' results from AI
-            if (finalIds.length > n) {
-              console.warn(
-                `[similar/${id}/ai] OpenAI returned ${finalIds.length} IDs, truncating to ${n}.`
-              );
-              finalIds = finalIds.slice(0, n);
-            }
-            console.log(
-              `[similar/${id}/ai] Parsed OpenAI IDs (${
-                finalIds.length
-              }): ${JSON.stringify(finalIds)}`
-            );
-          } catch (parseError) {
-            console.error(
-              `[similar/${id}/ai] Failed to parse JSON from OpenAI response: "${jsonMatch[1]}"`,
-              parseError
-            );
-            return res
-              .status(500)
-              .json({ error: "AI response was not valid JSON." });
-          }
-        } else {
-          console.warn(
-            `[similar/${id}/ai] No valid JSON array found in OpenAI response: "${openaiResponseText}"`
-          );
-          // Fallback will be triggered if no JSON array is found by the regex
-        }
-      } catch (e) {
-        console.error(
-          `[similar/${id}/ai] OpenAI call or JSON parse failed:`,
-          e
-        );
-        // Fallback will be triggered below
-      }
-    } else if (uniqueCands.length === 0) {
-      console.log(`[similar/${id}/ai] No candidates found for AI reranking.`);
-    } else {
-      console.log(
-        `[similar/${id}/ai] OpenAI client/model not configured or no candidates, skipping rerank.`
-      );
-    }
-
-    // 3. Fallback or use vector order if OpenAI missing / failed / no candidates initially
-    if (!Array.isArray(finalIds) || finalIds.length === 0) {
-      if (uniqueCands.length > 0) {
-        console.log(
-          `[similar/${id}/ai] Using fallback vector similarity order.`
-        );
-        finalIds = uniqueCands
-          .sort((a, b) => a.dist - b.dist) // Sort by distance
-          .slice(0, n) // Take top n
-          .map((r) => r.id); // Get IDs
-        console.log(
-          `[similar/${id}/ai] Fallback IDs (${
-            finalIds.length
-          }): ${JSON.stringify(finalIds)}`
-        );
-      } else {
-        console.log(
-          `[similar/${id}/ai] No candidates for fallback, returning empty.`
-        );
-        finalIds = [];
-      }
-    }
-
-    // 4. Fetch final rows & preserve order
-    if (finalIds.length === 0) {
-      console.log(`[similar/${id}/ai] No final IDs to fetch, returning empty.`);
-      return res.json([]);
-    }
-
-    console.log(
-      `[similar/${id}/ai] Fetching final ${finalIds.length} posts...`
+      rows: [ref],
+    } = await pool.query(
+      `SELECT embedding_short, embedding_full FROM content
+        WHERE id = $1 AND embedding_short IS NOT NULL AND embedding_full IS NOT NULL`,
+      [id]
     );
-    const numericFinalIds = finalIds.map(String).map(Number); // Ensure IDs are numbers for query
-    const { rows: finals } = await pool.query(
-      `SELECT ${CONTENT_COLS} FROM content WHERE id = ANY($1::int[])`,
-      [numericFinalIds] // Use the numeric array
-    );
-    console.log(
-      `[similar/${id}/ai] Found ${finals.length} posts in DB matching final IDs.`
-    );
+    if (!ref) return res.status(404).json({ error: "Post not found" });
 
-    const ordered = finalIds
-      .map((fid) => finals.find((r) => r.id === Number(fid))) // Compare with numeric ID
-      .filter(Boolean); // Remove any potential nulls if an ID wasn't found
-
-    if (ordered.length !== finalIds.length) {
-      console.warn(
-        `[similar/${id}/ai] Mismatch between final IDs (${finalIds.length}) and fetched posts (${ordered.length}). Some IDs might be invalid or missing.`
-      );
-    }
-
-    console.log(
-      `[similar/${id}/ai] Returning ${ordered.length} ordered posts.`
+    const { rows } = await pool.query(
+      `WITH cands AS (
+         (SELECT id, embedding_short <=> $1 AS dist
+            FROM content
+           WHERE id <> $3 AND embedding_short IS NOT NULL
+           ORDER BY embedding_short <=> $1
+           LIMIT $2)
+         UNION ALL
+         (SELECT id, embedding_full <=> $4 AS dist
+            FROM content
+           WHERE id <> $3 AND embedding_full IS NOT NULL
+           ORDER BY embedding_full <=> $4
+           LIMIT $2)
+       ), best AS (
+         SELECT id, MIN(dist) AS dist FROM cands GROUP BY id
+       )
+       SELECT ${V1_POST_COLS}
+         FROM best JOIN content USING (id)
+        ORDER BY best.dist, id
+        LIMIT $2`,
+      [ref.embedding_short, SIMILAR_LIMIT, id, ref.embedding_full]
     );
-    res.json(ordered);
+    res.json(rows);
   } catch (err) {
-    console.error(`[similar/${id}/ai] Error in route:`, err);
-    res.status(500).json({ error: "Internal server error" });
+    sendError(res, err, "GET /api/similar/:id");
   }
-});
+}
+app.get("/api/similar/:id", similarHandler);
+// Deprecated alias: the AI re-ranking is gone, but the deployed frontend still
+// calls /ai until it redeploys. Delete once the new frontend is live.
+app.get("/api/similar/:id/ai", similarHandler);
 
 // ---------------------------------------------------------------------------
 // Public v1 API — reads public.content, the same table the website uses.
