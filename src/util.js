@@ -13,6 +13,18 @@ function escapeHtml(unsafe) {
     .replace(/'/g, "&#039;");
 }
 
+// Scraped URLs end up in email hrefs/srcs: keep only http(s), escaped for an
+// attribute; anything else (javascript:, data:, junk) becomes "#".
+function safeHttpUrl(url) {
+  try {
+    const u = new URL(String(url));
+    if (u.protocol === "http:" || u.protocol === "https:") return escapeHtml(u.href);
+  } catch {
+    // not a URL
+  }
+  return "#";
+}
+
 // Helper function to get display title (matching frontend logic)
 function getDisplayTitle(article) {
   if (article.cleaned_title && article.cleaned_title !== article.title) {
@@ -64,6 +76,7 @@ const API_BASE_URL = (
 
 module.exports = {
   escapeHtml,
+  safeHttpUrl,
   getDisplayTitle,
   slugify,
   generateSimilarUrl,

@@ -13,6 +13,7 @@ const {
 } = require("./params");
 const {
   escapeHtml,
+  safeHttpUrl,
   getDisplayTitle,
   generateSimilarUrl,
   FRONTEND_URL,
@@ -170,7 +171,7 @@ function generateDigestHtml(subscription, newContent, total = newContent.length)
       (subscription.frequency === "daily" ||
         (item.novelty_score && item.novelty_score >= 71)); // Only show images for novelty 4-5 in weekly
     const imageHtml = shouldShowImage
-      ? `<img src="${escapeHtml(imageUrl)}" 
+      ? `<img src="${safeHttpUrl(imageUrl)}"
             alt="${escapeHtml(item.image_prompt || displayTitle)}" 
             style="width: 100%; max-width: 150px; height: auto; margin: 10px 0; border-radius: 8px;"
             width="150">`
@@ -185,7 +186,7 @@ function generateDigestHtml(subscription, newContent, total = newContent.length)
     if (item.source_type) {
       const sourceTypeText = getSourceTypeText(item.source_type);
       metadataParts.push(
-        `${sourceTypeText}&nbsp;&nbsp;|&nbsp;&nbsp;${item.source_type}`
+        `${escapeHtml(sourceTypeText)}&nbsp;&nbsp;|&nbsp;&nbsp;${escapeHtml(item.source_type)}`
       );
     }
     metadataParts.push(`${publishedDateFormatted}`);
@@ -242,9 +243,9 @@ function generateDigestHtml(subscription, newContent, total = newContent.length)
 
     return `
       <div style="${itemContainerStyle}">
-        <h3 style="margin-bottom: 5px; font-size: 1.3em;"><a href="${
+        <h3 style="margin-bottom: 5px; font-size: 1.3em;"><a href="${safeHttpUrl(
           item.source_url
-        }" style="color: #007bff; text-decoration: none;">${escapeHtml(
+        )}" style="color: #007bff; text-decoration: none;">${escapeHtml(
       displayTitle
     )}</a></h3>
         ${metadataHtml}

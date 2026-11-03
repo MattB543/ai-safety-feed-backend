@@ -167,6 +167,8 @@ function buildV1Where(q) {
         title ILIKE $${i} OR cleaned_title ILIKE $${i} OR
         sentence_summary ILIKE $${i} OR paragraph_summary ILIKE $${i} OR
         key_implication ILIKE $${i} OR cluster_tag ILIKE $${i} OR
+        why_valuable ILIKE $${i} OR unique_aspects ILIKE $${i} OR
+        author_credentials ILIKE $${i} OR
         array_to_string(authors, ' ') ILIKE $${i} OR
         array_to_string(topics, ' ') ILIKE $${i}
       )`

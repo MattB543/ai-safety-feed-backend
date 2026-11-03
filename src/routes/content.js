@@ -109,7 +109,9 @@ router.get("/api/content", async (req, res) => {
 
 // Posts by id, for the website's bookmarks: ?ids=1,2,3 (or repeat the key).
 // Returns a bare array in no particular order; unknown ids are left out.
-const MAX_BY_IDS = 100;
+// The new frontend sends chunks of 100; the cap is higher so the old frontend,
+// which sends every saved id in one request, keeps working during the rollout.
+const MAX_BY_IDS = 1000;
 router.get("/api/content/by-ids", async (req, res) => {
   const raw = listParam(req.query, "ids", { split: true });
   if (!raw.length) {

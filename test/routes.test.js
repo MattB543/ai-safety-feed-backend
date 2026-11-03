@@ -64,9 +64,9 @@ test("/api/content/by-ids returns V1 columns for up to 100 ids", async () => {
   assert.doesNotMatch(calls[0].sql, /full_content_markdown|embedding/);
 });
 
-test("/api/content/by-ids rejects more than 100 ids", async () => {
+test("/api/content/by-ids rejects more than 1000 ids", async () => {
   stubPool();
-  const ids = Array.from({ length: 101 }, (_, i) => i + 1);
+  const ids = Array.from({ length: 1001 }, (_, i) => i + 1);
   const res = await request(app).get(`/api/content/by-ids?ids=${ids.join(",")}`);
   assert.equal(res.status, 400);
   assert.equal(calls.length, 0);
