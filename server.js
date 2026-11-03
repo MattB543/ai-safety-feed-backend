@@ -1830,6 +1830,44 @@ async function rssHandler(req, res) {
 app.get("/rss.xml", rssHandler);
 app.get("/feed.xml", rssHandler);
 
+// ---------------------------------------------------------------------------
+// Sitemap. Netlify proxies https://aisafetyfeed.com/sitemap.xml here, so all
+// URLs are on FRONTEND_URL: the static pages plus every post's /similar page.
+// ---------------------------------------------------------------------------
+
+const SITEMAP_PAGES = ["/", "/about", "/digest", "/data"];
+// A sitemap file may list at most 50,000 URLs.
+const SITEMAP_MAX_POSTS = 50000 - SITEMAP_PAGES.length;
+
+app.get("/sitemap.xml", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, title, cleaned_title, COALESCE(updated_at, created_at) AS lastmod
+         FROM content
+        ORDER BY id DESC
+        LIMIT $1`,
+      [SITEMAP_MAX_POSTS]
+    );
+    const url = (loc, lastmod) =>
+      `  <url><loc>${xmlText(loc)}</loc>${
+        lastmod ? `<lastmod>${new Date(lastmod).toISOString().slice(0, 10)}</lastmod>` : ""
+      }</url>`;
+    const xml = [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+      ...SITEMAP_PAGES.map((p) => url(FRONTEND_URL + p)),
+      ...rows.map((r) => url(generateSimilarUrl(r, FRONTEND_URL), r.lastmod)),
+      "</urlset>",
+      "",
+    ].join("\n");
+    res.set("Content-Type", "application/xml; charset=utf-8");
+    res.set("Cache-Control", "public, max-age=3600");
+    res.send(xml);
+  } catch (err) {
+    sendError(res, err, "GET /sitemap.xml");
+  }
+});
+
 // --- Email Subscription Endpoints ---
 
 // POST /api/subscribe
