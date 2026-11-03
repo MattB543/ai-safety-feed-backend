@@ -271,8 +271,9 @@ app.use(
   })
 );
 
-// Helper to generate HTML (extracted from sendDigestEmail)
-function generateDigestHtml(subscription, newContent) {
+// Helper to generate HTML (extracted from sendDigestEmail). total is the
+// number of new posts, which can exceed the newContent shown.
+function generateDigestHtml(subscription, newContent, total = newContent.length) {
   const unsubscribeUrl = `${API_BASE_URL}/api/unsubscribe/${subscription.unsubscribe_token}`;
 
   // Calculate summary stats
@@ -388,18 +389,7 @@ function generateDigestHtml(subscription, newContent) {
 
     // Add novelty score
     if (item.novelty_score !== null && item.novelty_score !== undefined) {
-      let noveltyBucket = 1; // Default to 1 (0-20)
-      const score = item.novelty_score;
-      if (score >= 91) {
-        noveltyBucket = 5;
-      } else if (score >= 71) {
-        noveltyBucket = 4;
-      } else if (score >= 41) {
-        noveltyBucket = 3;
-      } else if (score >= 21) {
-        noveltyBucket = 2;
-      }
-      noveltyAndLinkParts.push(`Novelty Score: ${noveltyBucket}/5`);
+      noveltyAndLinkParts.push(`Novelty Score: ${noveltyBucketOf(item.novelty_score)}/5`);
     }
 
     // Add similar post link
@@ -479,6 +469,13 @@ function generateDigestHtml(subscription, newContent) {
       .join("");
   }
 
+  const seeAllHtml =
+    total > newContent.length
+      ? `<p style="font-size: 1.1em; margin: 20px 0;"><a href="${escapeHtml(
+          feedUrlForFilters(subscription.filters)
+        )}" style="color: #007bff; text-decoration: none;">See all ${total} new posts &rarr;</a></p>`
+      : "";
+
   return `
     <html>
       <body style="font-family: sans-serif; color: #333;">
@@ -486,6 +483,7 @@ function generateDigestHtml(subscription, newContent) {
           <h2 style="font-size: 1.6em;">Your ${subscription.frequency} <a href="${FRONTEND_URL}/" style="text-decoration: underline;">AI Safety Feed</a> Digest</h2>
           ${statsHtml}
           ${itemsHtml}
+          ${seeAllHtml}
           <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
           <p style="font-size: 0.9em; color: #888;">
             To unsubscribe from these updates, <a href="${unsubscribeUrl}" style="color: #007bff; text-decoration: none;">click here</a>.
@@ -496,7 +494,46 @@ function generateDigestHtml(subscription, newContent) {
   `;
 }
 
-// Helper to fetch content for a subscription (extracted and adapted from sendDigestEmail)
+// A digest lists at most this many posts; a "See all" link covers the rest.
+const DIGEST_MAX_ITEMS = 20;
+const DIGEST_FIELDS = [
+  "id", "title", "source_url", "sentence_summary", "published_date", "cluster_tag",
+  "topics", "novelty_score", "cleaned_title", "cleaned_image", "image_prompt",
+  "source_type", "full_content_markdown",
+];
+
+// A subscriber's saved filters ({ searchTerm, sources, tags, novelty 1-5 })
+// as buildV1Where query params, so the email filters exactly like the site.
+function subscriptionQuery(filters) {
+  const { searchTerm, sources, tags, novelty } = filters || {};
+  const noveltyMin = Number.isInteger(novelty) ? noveltyBucketMin(novelty) : undefined;
+  return {
+    search: typeof searchTerm === "string" ? searchTerm : undefined,
+    source_type: Array.isArray(sources) ? sources.map(String) : undefined,
+    tags: Array.isArray(tags) ? tags.map(String) : undefined,
+    novelty_min: noveltyMin === undefined ? undefined : String(noveltyMin),
+  };
+}
+
+// The website's feed with the same filters, in its URL format:
+// /?q=<search>&source=<name>&source=...&tag=<tag>&tag=...&novelty=<1-5>
+function feedUrlForFilters(filters) {
+  const { searchTerm, sources, tags, novelty } = filters || {};
+  const p = new URLSearchParams();
+  if (typeof searchTerm === "string" && searchTerm) p.append("q", searchTerm);
+  if (Array.isArray(sources)) sources.forEach((s) => p.append("source", s));
+  if (Array.isArray(tags)) tags.forEach((t) => p.append("tag", t));
+  if (Number.isInteger(novelty) && novelty >= 2 && novelty <= 5) {
+    p.append("novelty", String(novelty));
+  }
+  // %20 rather than +, which not every router decodes as a space.
+  const qs = p.toString().replace(/\+/g, "%20");
+  return `${FRONTEND_URL}/${qs ? `?${qs}` : ""}`;
+}
+
+// New posts for a subscription since its last digest: { rows, total }, where
+// rows is the newest DIGEST_MAX_ITEMS and total counts all of them. Returns
+// null on error.
 async function fetchContentForSubscription(subscription) {
   let fetchSinceDate = new Date();
   if (subscription.last_sent_at) {
@@ -510,69 +547,26 @@ async function fetchContentForSubscription(subscription) {
   }
   fetchSinceDate.setMinutes(fetchSinceDate.getMinutes() - 5); // Add buffer
 
-  const { searchTerm, sources, tags, novelty } = subscription.filters || {};
-  const queryParams = [];
-  const queryConditions = ["created_at > $1"];
-  queryParams.push(fetchSinceDate);
-  let paramIndex = 2;
-
-  // --- Build dynamic query conditions (same logic as before) ---
-  if (searchTerm) {
-    queryConditions.push(`(
-        title ILIKE $${paramIndex} OR
-        sentence_summary ILIKE $${paramIndex} OR
-        paragraph_summary ILIKE $${paramIndex} OR
-        array_to_string(topics,' ') ILIKE $${paramIndex} OR
-        cluster_tag ILIKE $${paramIndex}
-      )`);
-    queryParams.push(`%${searchTerm}%`);
-    paramIndex++;
-  }
-  if (sources && Array.isArray(sources) && sources.length > 0) {
-    queryConditions.push(`source_type = ANY($${paramIndex}::text[])`);
-    queryParams.push(sources);
-    paramIndex++;
-  }
-  if (tags && Array.isArray(tags) && tags.length > 0) {
-    queryConditions.push(`LOWER(cluster_tag) = ANY($${paramIndex}::text[])`);
-    queryParams.push(tags);
-    paramIndex++;
-  }
-  if (novelty && typeof novelty === "number" && novelty >= 1 && novelty <= 5) {
-    let minScore = 0;
-    switch (novelty) {
-      case 5:
-        minScore = 91;
-        break;
-      case 4:
-        minScore = 71;
-        break;
-      case 3:
-        minScore = 41;
-        break;
-      case 2:
-        minScore = 21;
-        break;
-    }
-    if (minScore > 0) {
-      queryConditions.push(`novelty_score >= $${paramIndex}`);
-      queryParams.push(minScore);
-      paramIndex++;
-    }
-  }
-  // --- End query condition building ---
-
-  const contentQuery = `
-    SELECT id, title, source_url, sentence_summary, published_date, cluster_tag, topics, novelty_score, cleaned_title, cleaned_image, image_prompt, source_type, full_content_markdown
-    FROM content
-    WHERE ${queryConditions.join(" AND ")}
-    ORDER BY published_date DESC
-    LIMIT 20;
-  `;
-
   try {
-    const { rows } = await pool.query(contentQuery, queryParams);
-    return rows;
+    const { whereSQL, params } = buildV1Where(subscriptionQuery(subscription.filters));
+    params.push(fetchSinceDate);
+    const where = `${whereSQL ? `${whereSQL} AND` : "WHERE"} created_at > $${params.length}`;
+
+    const { rows } = await pool.query(
+      `SELECT ${selectCols(DIGEST_FIELDS)} FROM content ${where}
+       ORDER BY ${V1_SORTS.newest}
+       LIMIT ${DIGEST_MAX_ITEMS}`,
+      params
+    );
+    // A short page is everything; only a full one needs counting.
+    let total = rows.length;
+    if (rows.length === DIGEST_MAX_ITEMS) {
+      const {
+        rows: [c],
+      } = await pool.query(`SELECT COUNT(*)::int AS total FROM content ${where}`, params);
+      total = c.total;
+    }
+    return { rows, total };
   } catch (err) {
     console.error(
       `[fetchContentForSubscription/${subscription.email}] Error querying content:`,
@@ -2057,15 +2051,16 @@ async function processSubscriptionsAndSendBatches() {
       console.log(
         `[CronJob/DigestBatch] Preparing ${sub.frequency} digest for ${sub.email} (ID: ${sub.id})`
       );
-      const newContent = await fetchContentForSubscription(sub);
+      const fetched = await fetchContentForSubscription(sub);
 
-      if (newContent === null) {
+      if (fetched === null) {
         // Error occurred during fetch, skip this sub for now
         console.error(
           `[CronJob/DigestBatch] Skipping ${sub.email} due to content fetch error.`
         );
         continue;
       }
+      const { rows: newContent, total } = fetched;
 
       if (newContent.length > 0) {
         // Create preheader text
@@ -2073,13 +2068,13 @@ async function processSubscriptionsAndSendBatches() {
         const sourceTypes = [
           ...new Set(newContent.map((c) => c.source_type)),
         ].filter(Boolean);
-        preheaderStats.push(`${newContent.length} new posts`);
+        preheaderStats.push(`${total} new posts`);
         if (sourceTypes.length > 0) {
           preheaderStats.push(`from ${sourceTypes.slice(0, 3).join(", ")}`);
         }
         const preheaderText = preheaderStats.join(" ");
 
-        const htmlBody = generateDigestHtml(sub, newContent);
+        const htmlBody = generateDigestHtml(sub, newContent, total);
 
         // Add hidden preheader span at the very beginning of the HTML
         const htmlWithPreheader = htmlBody
