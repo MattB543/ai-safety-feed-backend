@@ -154,6 +154,16 @@ function generateSimilarUrl(article, baseUrl) {
   return `${baseUrl}/similar/${slug}-${article.id}`;
 }
 
+// The website (Netlify) and this API (Render) live on different hosts.
+// FRONTEND_URL is for links to site pages (/similar/..., the feed);
+// API_BASE_URL is this API's public URL, for links back to it (unsubscribe).
+const FRONTEND_URL = (process.env.FRONTEND_URL || "https://aisafetyfeed.com").replace(/\/$/, "");
+const API_BASE_URL = (
+  process.env.API_BASE_URL ||
+  process.env.BASE_URL ||
+  `http://localhost:${process.env.PORT || "8000"}`
+).replace(/\/$/, "");
+
 const app = express();
 
 // Render terminates TLS and proxies to us. Trust that one hop so req.ip, and
@@ -229,7 +239,7 @@ const swaggerOptions = {
       description: "Public API for accessing AI safety posts and research",
       contact: {
         name: "AI Safety Feed",
-        url: "https://aisafetyfeed.com",
+        url: FRONTEND_URL,
       },
     },
     servers: [
@@ -263,12 +273,7 @@ app.use(
 
 // Helper to generate HTML (extracted from sendDigestEmail)
 function generateDigestHtml(subscription, newContent) {
-  // Determine the base URL for links
-  const port = process.env.PORT || "8000"; // Default port if not specified
-  const localBaseUrl = `http://localhost:${port}`;
-  const appBaseUrl = process.env.BASE_URL || localBaseUrl;
-
-  const unsubscribeUrl = `${appBaseUrl}/api/unsubscribe/${subscription.unsubscribe_token}`;
+  const unsubscribeUrl = `${API_BASE_URL}/api/unsubscribe/${subscription.unsubscribe_token}`;
 
   // Calculate summary stats
   const stats = newContent.reduce((acc, item) => {
@@ -398,7 +403,7 @@ function generateDigestHtml(subscription, newContent) {
     }
 
     // Add similar post link
-    const viewSimilarPostsUrl = generateSimilarUrl(item, appBaseUrl);
+    const viewSimilarPostsUrl = generateSimilarUrl(item, FRONTEND_URL);
     noveltyAndLinkParts.push(
       `<a href="${viewSimilarPostsUrl}" style="color: #007bff; text-decoration: none;">View details & similar posts</a>`
     );
@@ -478,7 +483,7 @@ function generateDigestHtml(subscription, newContent) {
     <html>
       <body style="font-family: sans-serif; color: #333;">
         <div style="max-width: 650px; margin-left: 0; margin-right: auto;">
-          <h2 style="font-size: 1.6em;">Your ${subscription.frequency} <a href="https://aisafetyfeed.com/" style="text-decoration: underline;">AI Safety Feed</a> Digest</h2>
+          <h2 style="font-size: 1.6em;">Your ${subscription.frequency} <a href="${FRONTEND_URL}/" style="text-decoration: underline;">AI Safety Feed</a> Digest</h2>
           ${statsHtml}
           ${itemsHtml}
           <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
@@ -1639,8 +1644,6 @@ app.get("/api/v1/posts/:id", (req, res) => {
 // RSS feed
 // ---------------------------------------------------------------------------
 
-const SITE_URL = "https://aisafetyfeed.com";
-
 // Characters XML 1.0 forbids even inside CDATA (control chars, lone
 // surrogates). A single one anywhere makes the whole feed unparseable.
 const XML_INVALID_CHARS = /[^\t\n\r\x20-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/gu;
@@ -1688,7 +1691,7 @@ function buildRssXml({ title, description, selfUrl, posts }) {
   const items = posts
     .map((p) => {
       const displayTitle = getDisplayTitle(p);
-      const similarUrl = generateSimilarUrl(p, SITE_URL);
+      const similarUrl = generateSimilarUrl(p, FRONTEND_URL);
       const authors = (p.authors || []).filter(Boolean);
       const categories = [p.cluster_tag, ...(p.topics || [])].filter(Boolean);
 
@@ -1741,7 +1744,7 @@ function buildRssXml({ title, description, selfUrl, posts }) {
      xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
     <title>${xmlText(title)}</title>
-    <link>${SITE_URL}</link>
+    <link>${FRONTEND_URL}</link>
     <description>${xmlText(description)}</description>
     <language>en-us</language>
     <lastBuildDate>${lastBuild}</lastBuildDate>
